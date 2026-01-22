@@ -1,417 +1,493 @@
-# VLM Document Parsing Quality Test & Tech Report
+# VLM Document Parsing Quality Test Framework
 
 > **"Does Structural Integrity in Parsing Improve Semantic Retrieval?"**
->
-> 본 프로젝트는 VLM(Qwen3-VL)의 구조화된 마크다운 출력이 전통적인 OCR 방식 대비 **Semantic Chunking** 및 **RAG(Retrieval-Augmented Generation)** 성능에 미치는 영향을 정량적으로 분석하는 프레임워크입니다.
+
+A comprehensive evaluation framework for quantitatively analyzing the impact of Vision-Language Model (VLM) structured markdown output on semantic chunking and RAG (Retrieval-Augmented Generation) performance compared to traditional OCR methods.
 
 ---
 
-## Quick Start: 언제 이걸 쓰나요?
-
-- 복잡한 PDF를 RAG에 넣었는데, **답변이 자꾸 엉키는 경우**
-- VLM 파서 vs 기존 OCR 파서를 **정량 비교**하고 싶은 경우
-- 한국어/멀티컬럼/표가 많은 문서에 **최적 청킹 전략**을 찾고 싶은 경우
-- 스캔된 PDF에서 **VLM만 텍스트 추출이 가능**한지 확인하고 싶은 경우
+## Quick Start
 
 ```bash
-# 30초 만에 시작하기
+# Install dependencies
 uv sync
-python -m src.test_parsers --pdf your_document.pdf --gt your_ground_truth.md
+
+# Run parser comparison benchmark
+python -m src.test_parsers --pdf data/test_1/test_data_1.pdf --gt data/test_1/gt_data_1.md
+
+# Run full evaluation pipeline
+python -m src.run_benchmark --config experiments/config.yaml
 ```
 
 ---
 
-## 1. Research Motivation
+## Table of Contents
 
-기존 RAG 파이프라인은 주로 Plain Text에 의존해 왔습니다. 그러나 표(Table), 계층 구조(Headers), 목록(Lists)이 포함된 복잡한 문서에서 구조 정보의 손실은 곧 **의미적 단절(Semantic Discontinuity)**로 이어집니다.
+- [Overview](#overview)
+- [Key Features](#key-features)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Evaluation Metrics](#evaluation-metrics)
+- [Project Structure](#project-structure)
+- [Tech Report](#tech-report)
+- [Experimental Results](#experimental-results)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Overview
 
 ### Problem Statement
 
-- **구조 손실**: 전통적인 OCR은 레이아웃 순서가 꼬이거나 표 내부 데이터를 단순 텍스트로 치환하여 청킹(Chunking) 시 맥락을 파괴
-- **Multi-column 오류**: 2단 레이아웃에서 좌→우가 아닌 상→하로 읽어 문장이 뒤섞임
-- **표 구조 붕괴**: 행-열 관계가 파괴되어 데이터 의미 상실
+Traditional RAG pipelines rely heavily on plain text extraction, which fails to preserve critical document structures:
+
+- **Table Structure Loss**: Row-column relationships destroyed
+- **Multi-column Errors**: Reading order confusion in two-column layouts
+- **Header Hierarchy Loss**: Section relationships not preserved
+- **Semantic Discontinuity**: Chunking breaks at wrong positions
 
 ### Hypothesis
 
-> VLM 기반의 **Agentic Reasoning**을 통한 마크다운 파싱은 문서의 논리적 구조를 보존하며, 이는 Boundary Score와 Chunk Score를 개선하여 최종적인 검색 정확도를 높일 것이다.
+> VLM-based parsing produces structured markdown that preserves document layout, leading to better semantic chunking boundaries (higher Boundary Score) and improved chunk coherence (higher Chunk Score), ultimately resulting in better retrieval accuracy.
+
+### Core Research Questions
+
+| RQ | Question | Metrics |
+|----|----------|---------|
+| **RQ1** | Does VLM achieve better lexical accuracy? | CER, WER |
+| **RQ2** | Does VLM preserve structure better? | Boundary Score, Chunk Score |
+| **RQ3** | Does better parsing improve retrieval? | Hit Rate@k, MRR |
 
 ---
 
-## 2. Methodology
+## Key Features
 
-### 2.1 Multi-Modal Agentic Parsing
+### Multi-Parser Support
+- **VLM Parser** (Qwen3-VL): Structured markdown output with layout understanding
+- **pdfplumber**: Fast digital PDF text extraction
+- **Docling + RapidOCR**: Scanned document OCR
+
+### Comprehensive Evaluation
+- **Lexical Metrics**: CER, WER with Korean morphological analysis (MeCab)
+- **Structural Metrics**: Boundary Score, Chunk Score
+- **Retrieval Metrics**: Hit Rate@k, MRR with statistical significance testing
+- **Error Analysis**: Automatic error detection, categorization, and case study generation
+
+### Research Infrastructure
+- **Tech Report Template**: Complete academic report structure
+- **Experiment Configuration**: YAML-based reproducible experiments
+- **Q&A Generation**: LLM-powered evaluation dataset creation
+- **Benchmark Runner**: Automated end-to-end evaluation pipeline
+
+---
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Document (PDF/Image)                                           │
-│       │                                                         │
-│       ▼                                                         │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │           PDF → Image Conversion (150 DPI)               │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│       │                                                         │
-│       ▼                                                         │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Parsing Layer (3 Methods)                   │   │
-│  │  ┌───────────────┬───────────────┬───────────────┐      │   │
-│  │  │   VLM         │  pdfplumber   │   RapidOCR    │      │   │
-│  │  │  (Qwen3-VL)   │   (Digital)   │   (Scanned)   │      │   │
-│  │  │               │               │               │      │   │
-│  │  │  Structured   │  Plain Text   │  Plain Text   │      │   │
-│  │  │  Markdown     │  + Tables     │  (OCR only)   │      │   │
-│  │  └───────────────┴───────────────┴───────────────┘      │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│       │                                                         │
-│       ▼                                                         │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Evaluation Metrics                          │   │
-│  │         CER • WER • Latency • BS • CS                    │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Document Input                                │
+│                     (PDF / Image / Scan)                            │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Parsing Layer                                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
+│  │    VLM      │  │ pdfplumber  │  │   Docling   │                 │
+│  │ (Qwen3-VL)  │  │  (Digital)  │  │ (RapidOCR)  │                 │
+│  │  Markdown   │  │ Plain Text  │  │ Plain Text  │                 │
+│  └─────────────┘  └─────────────┘  └─────────────┘                 │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Chunking Layer                                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
+│  │   Fixed     │  │  Recursive  │  │  Semantic   │                 │
+│  │    Size     │  │  Character  │  │   (Topic)   │                 │
+│  └─────────────┘  └─────────────┘  └─────────────┘                 │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Evaluation Layer                                  │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
+│  │  Lexical  │  │ Structural│  │ Retrieval │  │   Error   │       │
+│  │ CER, WER  │  │  BS, CS   │  │ HR@k, MRR │  │ Analysis  │       │
+│  └───────────┘  └───────────┘  └───────────┘  └───────────┘       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-Qwen3-VL-Thinking 모델은 이미지 내 요소를 단순히 읽는 것이 아니라, 내부 추론(`Chain-of-Thought`) 과정을 통해 요소 간 관계를 정의합니다.
+---
 
-- **Layout Understanding**: 문서의 전체 레이아웃 파악 및 읽기 순서 결정
-- **Table Structure Recognition**: 표 내부의 행-열 관계 및 헤더 인식
-- **Hierarchical Heading**: 제목-부제목-본문의 계층 구조 보존
+## Installation
 
-### 2.2 Evaluation Metrics
+### Prerequisites
 
-#### Phase 1: Lexical Accuracy (어휘적 정확도)
+- Python 3.11+
+- CUDA-capable GPU (for VLM inference)
+- MeCab (for Korean tokenization)
 
-문서 인식의 근본적인 정확도를 측정하기 위해 편집 거리(Levenshtein Distance) 기반 알고리즘을 사용합니다.
+### Using uv (Recommended)
+
+```bash
+git clone https://github.com/your-repo/test-vlm-document-parsing.git
+cd test-vlm-document-parsing
+
+# Install with uv
+uv sync
+
+# Install Korean NLP support
+uv sync --extra korean
+```
+
+### Using pip
+
+```bash
+pip install -e .
+
+# For Korean support
+pip install -e ".[korean]"
+
+# For all features
+pip install -e ".[all]"
+```
+
+### MeCab Installation (Ubuntu)
+
+```bash
+sudo apt-get install mecab mecab-ko mecab-ko-dic libmecab-dev
+pip install mecab-python3
+```
+
+---
+
+## Usage
+
+### 1. Basic Parser Comparison
+
+```bash
+# Compare all parsers on a document
+python -m src.test_parsers \
+    --pdf data/test_1/test_data_1.pdf \
+    --gt data/test_1/gt_data_1.md \
+    --tokenizer mecab
+
+# Skip VLM (when GPU unavailable)
+python -m src.test_parsers --pdf document.pdf --gt ground_truth.md --skip-vlm
+```
+
+### 2. Full Benchmark Pipeline
+
+```bash
+# Run complete evaluation with config
+python -m src.run_benchmark --config experiments/config.yaml
+
+# Run on single document
+python -m src.run_benchmark \
+    --pdf data/test_1/test_data_1.pdf \
+    --gt data/test_1/gt_data_1.md \
+    --qa data/qa_pairs.json \
+    --output results/
+```
+
+### 3. Generate Q&A Dataset
+
+```bash
+# Generate Q&A pairs from ground truth documents
+python -m experiments.generate_qa \
+    --config experiments/config.yaml \
+    --output data/qa_pairs.json
+
+# Use specific LLM provider
+python -m experiments.generate_qa --provider openai --questions-per-doc 15
+```
+
+### 4. Streamlit Web UI
+
+```bash
+streamlit run src/app.py --server.port 8501
+```
+
+---
+
+## Evaluation Metrics
+
+### Phase 1: Lexical Accuracy
 
 | Metric | Formula | Description |
 |--------|---------|-------------|
-| **CER** | `(S + D + I) / N` | 문자 단위 오류율. N = GT 문자 수 |
-| **WER** | `(S + D + I) / N` | 단어 단위 오류율. N = GT 토큰 수 |
+| **CER** | `(S + D + I) / N` | Character Error Rate |
+| **WER** | `(S + D + I) / N` | Word Error Rate (with morphological tokenization) |
 
-- `S`: Substitution (교체) - 잘못 인식된 문자/단어
-- `D`: Deletion (삭제) - 누락된 문자/단어
-- `I`: Insertion (삽입) - 추가된 문자/단어 (hallucination 포함)
+- `S`: Substitutions (incorrect characters/words)
+- `D`: Deletions (missing content)
+- `I`: Insertions (hallucinated content)
+- `N`: Total characters/words in ground truth
 
-**한국어 특화**: 교착어 특성상 공백 기반 토큰화가 부적절하므로 `MeCab/Okt` 형태소 분석기를 통한 토큰화 후 WER 측정을 병행합니다.
+### Phase 2: Structural Integrity
 
-#### Phase 2: Semantic Integrity (의미적 완전성)
+| Metric | Formula | Description |
+|--------|---------|-------------|
+| **Boundary Score (BS)** | `\|B_pred ∩ B_gt\| / \|B_gt\|` | Semantic boundary alignment |
+| **Chunk Score (CS)** | `avg(coherence(chunk))` | Intra-chunk semantic coherence |
 
-구조화된 데이터가 청킹 품질에 미치는 영향을 측정합니다.
+### Phase 3: Retrieval Performance
 
-| Metric | Description |
-|--------|-------------|
-| **Boundary Score (BS)** | 의미적으로 분리되어야 할 지점에서 정확히 청크가 나뉘었는가? |
-| **Chunk Score (CS)** | 나뉜 청크가 독립적으로 완전한 의미 정보를 포함하는가? |
+| Metric | Formula | Description |
+|--------|---------|-------------|
+| **Hit Rate@k** | `hits_in_top_k / total_queries` | Relevant chunk in top-k results |
+| **MRR** | `(1/N) * Σ(1/rank_i)` | Mean Reciprocal Rank |
 
-### 2.3 How to Read the Metrics
+### Quality Thresholds
 
-| Metric | Good | Bad | Interpretation |
-|--------|------|-----|----------------|
-| **CER** | < 10% | > 30% | 0에 가까울수록 문자 인식 정확 |
-| **WER** | < 15% | > 40% | 0에 가까울수록 단어 인식 정확 |
-| **BS** | > 0.8 | < 0.5 | 1에 가까울수록 경계 분리 정확 |
-| **CS** | > 0.8 | < 0.5 | 1에 가까울수록 청크 품질 우수 |
-
-**핵심 인사이트**: VLM 파서는 CER/WER이 약간 나빠도 BS/CS가 높아, RAG 검색 정확도에서 이득을 줄 수 있습니다. 단순 텍스트 정확도보다 **구조 보존**이 더 중요한 경우가 많습니다.
-
----
-
-## 3. Technical Specifications
-
-| Component | Specification |
-|-----------|---------------|
-| **VLM Model** | `Qwen3-VL-8B-Thinking` (OpenAI Vision API Compatible) |
-| **VLM Server** | `vLLM` with CUDA Acceleration |
-| **OCR Engine (Digital)** | `pdfplumber` - 디지털 PDF 텍스트 추출 |
-| **OCR Engine (Scanned)** | `RapidOCR` via Docling - 이미지 기반 OCR |
-| **PDF to Image** | `pdf2image` (poppler) / `pdfplumber` fallback |
-| **Tokenizer (Korean)** | `KoNLPy` - MeCab (권장) / Okt (순수 Python) |
-| **Tokenizer (English)** | Whitespace split |
-| **Evaluation Library** | `jiwer` - CER/WER 계산 |
+| Metric | Excellent | Good | Acceptable |
+|--------|-----------|------|------------|
+| CER | < 2% | < 5% | < 10% |
+| WER | < 5% | < 10% | < 20% |
+| BS | > 0.9 | > 0.8 | > 0.7 |
+| Hit Rate@5 | > 90% | > 75% | > 60% |
 
 ---
 
-## 4. Experimental Design
-
-### 4.1 Test Datasets
-
-| ID | File | Type | Pages | GT Source |
-|----|------|------|-------|-----------|
-| test_1 | `test_data_1.pdf` | Digital PDF (Korean) | 4 | Manual Transcription |
-| test_2 | `test_data_2.jpg` | Image | 1 | Manual Transcription |
-| test_3 | `Chain-of-Thought...pdf` | Scanned PDF (Paper) | 4 | Manual Transcription |
-| test_4 | `2025_한국부자보고서.pdf` | Digital PDF (Korean) | - | Manual Transcription |
-
-### 4.2 Parser Comparison
-
-| Parser | Input | Output Format | Pros | Cons |
-|--------|-------|---------------|------|------|
-| **VLM** | Image | Structured Markdown | 구조 보존, 스캔 지원 | 느림, GPU 필요 |
-| **pdfplumber** | PDF | Plain Text + Tables | 빠름, 정확함 | 디지털 전용, 구조 손실 |
-| **RapidOCR** | Image | Plain Text | 스캔 지원 | 구조 손실, 한국어 약함 |
-
-### 4.3 Ground Truth 작성 원칙
-
-CER/WER 평가를 위한 GT는 **원문 전사(Verbatim Transcription)** 방식으로 작성합니다.
+## Project Structure
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Ground Truth 작성 원칙                                     │
-├─────────────────────────────────────────────────────────────┤
-│  1. 원문 그대로 전사 (요약/정리 X)                          │
-│  2. 페이지 단위 작성 권장 (전체보다 대표 페이지 선정)       │
-│  3. 읽기 순서대로 텍스트 나열                               │
-│  4. 마크다운으로 구조 보존 (헤더, 표, 리스트)               │
-└─────────────────────────────────────────────────────────────┘
+test-vlm-document-parsing/
+├── src/
+│   ├── app.py                    # Streamlit Web UI
+│   ├── test_parsers.py           # CLI parser comparison tool
+│   ├── run_benchmark.py          # Full evaluation pipeline
+│   │
+│   ├── parsers/                  # Parser implementations
+│   │   ├── vlm_parser.py         # Qwen3-VL integration
+│   │   ├── ocr_parser.py         # pdfplumber parser
+│   │   └── docling_parser.py     # Docling + RapidOCR
+│   │
+│   ├── chunking/                 # Text chunking module
+│   │   ├── chunker.py            # Chunking strategies
+│   │   └── metrics.py            # BS, CS calculation
+│   │
+│   ├── retrieval/                # Retrieval evaluation
+│   │   ├── embedder.py           # Text embeddings
+│   │   ├── retriever.py          # Semantic search
+│   │   └── evaluator.py          # HR@k, MRR metrics
+│   │
+│   ├── error_analysis/           # Error analysis module
+│   │   ├── analyzer.py           # Error detection
+│   │   ├── diff_visualizer.py    # HTML diff generation
+│   │   └── case_study.py         # Case study generator
+│   │
+│   └── evaluation/               # Unified evaluation interface
+│       └── __init__.py           # Integration module
+│
+├── experiments/
+│   ├── config.yaml               # Experiment configuration
+│   └── generate_qa.py            # Q&A dataset generator
+│
+├── data/
+│   ├── test_1/                   # Korean government document
+│   ├── test_2/                   # Receipt image
+│   ├── test_3/                   # English academic paper
+│   └── qa_pairs.json             # Generated Q&A dataset
+│
+├── docs/
+│   └── tech_report/              # Technical report sections
+│       ├── 00_Abstract.md
+│       ├── 01_Introduction.md
+│       ├── 02_Related_Work.md
+│       ├── 03_Methodology.md
+│       ├── 04_Experimental_Setup.md
+│       ├── 05_Results.md
+│       ├── 06_Discussion.md
+│       ├── 07_Conclusion.md
+│       ├── 08_References.md
+│       ├── appendix/
+│       └── figures/
+│
+├── results/                      # Evaluation outputs
+│   ├── retrieval/
+│   ├── structure/
+│   ├── errors/
+│   └── ablation/
+│
+├── _drafts/                      # Legacy evaluation modules
+├── pyproject.toml
+├── README.md
+└── README.ko.md                  # Korean documentation
 ```
-
-### 4.4 Ground Truth Examples
-
-실제 GT 파일을 참고하여 동일한 스타일로 작성하세요:
-
-- `data/test_1/gt_data_1.md`: 한국어 공고문 (표 포함)
-- `data/test_3/gt_data_3.md`: 영어 논문 (섹션 구조)
 
 ---
 
-## 5. Prompt Engineering (Tech Report)
+## Tech Report
 
-### 5.1 Problem: VLM Hallucination
+The framework includes a complete academic tech report template:
 
-초기 프롬프트 사용 시 VLM이 **요약, 설명, 추론**을 추가하여 `Insertion` 에러가 급증하는 문제가 발생했습니다.
+| Section | Content |
+|---------|---------|
+| **Abstract** | Research summary, key findings |
+| **Introduction** | Problem definition, research questions, contributions |
+| **Related Work** | VLM, OCR, RAG literature review |
+| **Methodology** | Evaluation framework, metric formulas |
+| **Experimental Setup** | Dataset, parser configs, parameters |
+| **Results** | Tables and analysis (template) |
+| **Discussion** | RQ answers, error patterns, limitations |
+| **Conclusion** | Findings, hybrid strategy recommendation |
+| **References** | 26 academic citations |
+| **Appendix** | Prompt variations, full results, case studies |
 
-**기존 프롬프트 (v1)**:
+---
+
+## Experimental Results
+
+### Preliminary Results (test_3 - Scanned PDF)
+
+| Parser | CER | WER | Latency |
+|--------|-----|-----|---------|
+| **VLM (Qwen3-VL)** | 56.29% | 70.85% | 15.61s |
+| pdfplumber | 99.62% | 100% | 18.12s |
+| RapidOCR | N/A | N/A | 6.85s |
+
+**Key Finding**: For scanned documents, VLM is the only viable option.
+
+### Hybrid Strategy Recommendation
+
 ```
-You are a document structure extraction expert.
-Convert this document image to well-structured Markdown.
-...
+Document Input
+     │
+     ▼
+  Scanned? ──Yes──► VLM (Required)
+     │
+    No
+     │
+     ▼
+  Complex Layout? ──Yes──► VLM (Recommended)
+  (Tables, Multi-column)
+     │
+    No
+     │
+     ▼
+  pdfplumber (Fast, Sufficient)
 ```
 
-**문제점**:
-- VLM이 "extraction expert"로서 내용을 **해석하고 정리**하려는 경향
-- 원문에 없는 설명 문장 추가 → `I` (Insertion) 에러 증가
-- CER 수치가 비정상적으로 높아짐
+---
 
-### 5.2 Solution: Transcription-focused Prompt
+## Prompt Engineering
 
-**개선된 프롬프트 (v2)**:
+### Problem: VLM Hallucination
+
+Early prompts caused VLM to add summaries and explanations, increasing insertion errors.
+
+### Solution: Transcription-focused Prompt (v2)
+
 ```
 You are a document TRANSCRIPTION engine, not a writer.
 Your job is to CONVERT the given document image into Markdown by
 STRICTLY TRANSCRIBING what is visible in the image.
 
-## Hard Constraints (must follow):
+## Hard Constraints:
 - DO NOT add, rephrase, summarize, infer, or translate any text.
 - DO NOT explain, comment, or describe what you are doing.
-- If something is partially cut off or unreadable, write `[UNREADABLE]` instead of guessing.
-- If a value is missing in the image, leave it blank or use `[EMPTY]`. Never invent values.
-
-## Markdown Formatting Rules:
-1. Headers: use `#` for the main title, `##` for sections, `###` for subsections
-2. Tables: preserve rows/columns as Markdown tables using `|` and `---`
-3. Lists: use `-` for bullets, `1.` for numbered lists
-4. Images/Charts: if there is a visible caption, transcribe it; otherwise use `[Figure]`
-5. Forms: use `Field: Value` exactly as written
-
-## Important:
-- Follow the reading order a human would use (left to right, top to bottom).
-- Preserve line breaks and spacing where they matter for meaning (e.g., in tables or forms).
-- Output VALID Markdown ONLY. No extra text before or after.
+- If something is unreadable, write `[UNREADABLE]` instead of guessing.
+- If a value is missing, use `[EMPTY]`. Never invent values.
 
 ## Output:
 (Write ONLY the transcribed Markdown content here.)
 ```
 
-### 5.3 Key Changes
+---
 
-| Aspect | v1 (기존) | v2 (개선) |
-|--------|----------|----------|
-| **Role** | "extraction expert" | "TRANSCRIPTION engine" |
-| **Goal** | 구조 추출 | 원문 전사 |
-| **Constraints** | 암시적 | 명시적 Hard Constraints |
-| **Hallucination** | 허용 | `[UNREADABLE]`, `[EMPTY]` 사용 |
-| **Output** | Markdown + 설명 가능 | Markdown ONLY |
+## Configuration
 
-### 5.4 Expected Improvement
+All experiments are controlled via `experiments/config.yaml`:
 
-| Metric | Before (v1) | After (v2) | Change |
-|--------|-------------|------------|--------|
-| **CER** | ~56% | TBD | ↓ Expected |
-| **Insertion (I)** | 2,559 | TBD | ↓↓ Expected |
-| **Hallucination** | High | Low | ↓↓ Expected |
+```yaml
+# Chunking (fixed for fair comparison)
+chunking:
+  strategy: "recursive_character"
+  chunk_size: 500
+  chunk_overlap: 50
+
+# Embedding
+embedding:
+  model: "jhgan/ko-sroberta-multitask"
+  device: "cuda"
+
+# Retrieval
+retrieval:
+  top_k: [1, 3, 5, 10]
+
+# Quality thresholds
+thresholds:
+  cer:
+    excellent: 0.02
+    good: 0.05
+```
 
 ---
 
-## 6. Preliminary Results
+## API Reference
 
-### 6.1 Observations
-
-| Insight | Description |
-|---------|-------------|
-| **VLM 강점** | 스캔 PDF에서 pdfplumber/RapidOCR 완전 실패, VLM만 텍스트 추출 성공 |
-| **Latency Trade-off** | VLM은 전통적 방식 대비 3~10배 느림 → Hybrid 전략 필요 |
-| **Hallucination** | Thinking 모델 사용 시 설명이 추가되어 Insertion 에러 발생 경향 |
-
-### 6.2 Example: Scanned PDF (test_3)
-
-| Parser | CER | WER | Latency | Note |
-|--------|-----|-----|---------|------|
-| **VLM** | 56.29% | 70.85% | 15.61s | 유일하게 텍스트 추출 성공 |
-| pdfplumber | 99.62% | 100% | 18.12s | 스캔 PDF → 추출 실패 |
-| RapidOCR | N/A | N/A | 6.85s | 완전 실패 (0 chars) |
-
-**핵심 발견**: 스캔된 PDF에서는 VLM이 **유일한 선택지**입니다.
-
-### 6.3 Hybrid Strategy Proposal
+### UnifiedEvaluator
 
 ```python
-def select_parser(pdf_bytes):
-    pdf_type = detect_pdf_type(pdf_bytes)
+from src.evaluation import UnifiedEvaluator
 
-    if pdf_type == "digital" and has_text:
-        return "pdfplumber"  # Fast & Accurate
-    elif pdf_type == "scanned" or has_complex_layout:
-        return "VLM"         # Structure Preservation
-    else:
-        return "RapidOCR"    # Fallback
+evaluator = UnifiedEvaluator(config)
+
+# Full evaluation
+results = evaluator.evaluate_full(
+    parsed_text=parsed_content,
+    ground_truth=gt_content,
+    qa_pairs=qa_data,
+    document_id="test_1",
+    parser_name="vlm"
+)
+
+# Individual metrics
+lexical = evaluator.evaluate_lexical(parsed, gt)
+structural = evaluator.evaluate_structural(parsed, gt)
+retrieval = evaluator.evaluate_retrieval(parsed, qa_pairs)
+errors = evaluator.analyze_errors(parsed, gt)
 ```
 
 ---
 
-## 7. Known Issues & Error Patterns
+## Contributing
 
-### 7.1 VLM Hallucination
-
-**증상**: VLM이 원문에 없는 설명/요약을 추가하여 Insertion 에러 급증
-
-**Mitigation**:
-- Transcription-focused 프롬프트 사용 (섹션 5.2 참조)
-- `max_tokens` 제한으로 과도한 생성 방지
-- `temperature: 0.1` 로 창의성 억제
-
-### 7.2 RapidOCR 한국어 인식 약함
-
-**증상**: 한국어 문서에서 인식률이 현저히 낮음
-
-**Mitigation**:
-- 스캔 품질 개선 (DPI 증가)
-- 한국어 문서는 VLM 또는 pdfplumber 우선 사용
-- 후처리 규칙 추가 (특수문자 정리)
-
-### 7.3 Multi-column 레이아웃 순서 꼬임
-
-**증상**: 2단 레이아웃에서 텍스트 순서가 뒤섞임
-
-**Mitigation**:
-- VLM 우선 사용 (레이아웃 이해 능력)
-- Column-wise crop 후 개별 OCR
-- 후처리로 순서 재정렬
-
-### 7.4 GT와 Parser 출력 범위 불일치
-
-**증상**: GT는 1페이지, Parser는 전체 페이지 추출 → CER 2000%+
-
-**Mitigation**:
-- GT와 동일한 페이지 범위로 파싱 제한
-- GT 작성 시 전사 범위 명시
-- 페이지 단위로 개별 평가
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit changes (`git commit -m 'Add amazing feature'`)
+4. Push to branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ---
 
-## 8. Project Structure
-
-```
-test-vlm-document-parsing/
-├── src/
-│   ├── app.py                 # Streamlit 비교 UI
-│   ├── test_parsers.py        # CLI 벤치마크 스크립트
-│   └── parsers/
-│       ├── __init__.py
-│       ├── vlm_parser.py      # VLM Parser (Qwen3-VL)
-│       ├── ocr_parser.py      # pdfplumber + ImageOCR
-│       └── docling_parser.py  # Docling (RapidOCR)
-├── data/
-│   ├── test_1/                # 한국어 공고문 PDF + GT
-│   ├── test_2/                # Image + GT
-│   ├── test_3/                # 영어 논문 (스캔) + GT
-│   └── test_4/                # 한국어 보고서 + GT
-├── pyproject.toml
-└── README.md
-```
-
----
-
-## 9. How to Run
-
-### 9.1 Installation
-
-```bash
-# uv 사용 (권장)
-uv sync
-
-# 또는 pip
-pip install -e .
-
-# 한국어 평가를 위한 MeCab 설치 (Ubuntu)
-sudo apt-get install mecab mecab-ko mecab-ko-dic libmecab-dev
-pip install mecab-python3
-```
-
-### 9.2 Running Benchmark
-
-```bash
-# 기본 실행 (3개 파서 비교)
-python -m src.test_parsers \
-    --pdf data/test_1/test_data_1.pdf \
-    --gt data/test_1/gt_data_1.md
-
-# 한국어 토크나이저 사용
-python -m src.test_parsers \
-    --pdf data/test_4/2025_한국부자보고서.pdf \
-    --gt data/test_4/gt_data_4.md \
-    --tokenizer mecab
-
-# 결과 저장
-python -m src.test_parsers \
-    --pdf data/test_3/test_data_3.pdf \
-    --gt data/test_3/gt_data_3.md \
-    --output-dir results/test_3
-
-# 옵션
---skip-vlm       # VLM 테스트 스킵 (GPU 없을 때)
---skip-docling   # Docling 테스트 스킵
---verbose        # 추출 결과 미리보기
---save-docs      # docs/Parsing_test_<날짜>/ 에 저장
-```
-
-### 9.3 Streamlit UI
-
-```bash
-cd src
-streamlit run app.py --server.port 8501
-```
-
----
-
-## 10. Future Work
-
-- [ ] **Prompt v2 검증**: Transcription-focused 프롬프트 효과 정량 평가
-- [ ] **Semantic Chunking Integration**: 파싱된 마크다운 기반 `Hierarchical Chunking` 알고리즘 구현
-- [ ] **Vector Search Benchmarking**: 파싱 결과물이 Vector DB 검색 Hit Rate에 미치는 영향 측정
-- [ ] **LLM-based Evaluation**: GPT-4o 기반 `G-Eval`로 파싱 품질 정성 평가
-- [ ] **Multi-page GT Automation**: VLM을 활용한 반자동 GT 생성 파이프라인
-
----
-
-## 11. References
+## References
 
 - [jiwer](https://github.com/jitsi/jiwer) - CER/WER calculation
 - [pdfplumber](https://github.com/jsvine/pdfplumber) - PDF text extraction
-- [Docling](https://github.com/DS4SD/docling) - Document understanding with RapidOCR
+- [Docling](https://github.com/DS4SD/docling) - Document understanding
 - [KoNLPy](https://konlpy.org/) - Korean NLP toolkit
 - [Qwen-VL](https://github.com/QwenLM/Qwen-VL) - Vision-Language Model
+- [sentence-transformers](https://www.sbert.net/) - Text embeddings
 
 ---
 
 ## License
 
 MIT License
+
+---
+
+## Citation
+
+```bibtex
+@software{vlm_document_parsing,
+  title = {VLM Document Parsing Quality Test Framework},
+  year = {2025},
+  url = {https://github.com/your-repo/test-vlm-document-parsing}
+}
+```
