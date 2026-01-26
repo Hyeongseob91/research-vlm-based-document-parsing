@@ -14,6 +14,10 @@ dependencies = [
     "pandas>=2.0.0",
     "pdf2image>=1.16.0",
     "konlpy>=0.6.0",
+    "pytest>=9.0.2",
+    "plotly>=5.18.0",
+    "numpy>=1.24.0",
+    "docling>=2.69.0",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +41,9 @@ dev = [
 all = [
     "vlm-document-parsing-test[korean,visualization,docling,dev]",
 ]
+
+[project.scripts]
+test-chunking = "src.test_chunking:main"
 
 [build-system]
 requires = ["hatchling"]
