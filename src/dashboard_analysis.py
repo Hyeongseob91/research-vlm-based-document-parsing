@@ -376,13 +376,13 @@ def create_overview_grouped_bar(all_data: Dict, metric: str, title: str,
         title=dict(text=f"{title} ({direction})", font=dict(size=13, color="#1a1a2e"), x=0),
         barmode="group",
         height=280,
-        margin=dict(l=40, r=20, t=50, b=40),
+        margin=dict(l=40, r=20, t=50, b=60),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(size=10, color="#666"),
         xaxis=dict(showgrid=False, tickfont=dict(size=10)),
         yaxis=dict(gridcolor="#E5E5E5", gridwidth=0.5, zeroline=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="left", x=0,
                    font=dict(size=9)),
         bargap=0.3,
         bargroupgap=0.1,
@@ -444,49 +444,24 @@ with tab_parsing:
     # --- Main Content ---
     st.markdown("## Parsing Test Results")
 
-    # A. Metrics Overview
+    # A. Metrics Overview (항상 표시)
     st.markdown("### 📐 Metrics Overview")
 
-    st.markdown("""
-    <div style="background-color: #F5F5F5; padding: 1.5rem; border-radius: 8px; margin-bottom: 1rem;">
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
-            <div>
-                <p style="font-size: 1.1rem; font-weight: 600; color: #1a1a2e; margin-bottom: 0.5rem;">
-                    WER (Word Error Rate) <span style="color: #059669; font-size: 0.9rem;">↓ 낮을수록 좋음</span>
-                </p>
-                <ul style="color: #555; margin: 0; padding-left: 1.2rem; font-size: 0.9rem;">
-                    <li>Mecab Tokenizer 기반 단어 단위 오류율</li>
-                    <li>삽입/삭제/대체 오류를 종합 측정</li>
-                </ul>
+    ov_col1, ov_col2 = st.columns(2)
 
-                <p style="font-size: 1.1rem; font-weight: 600; color: #1a1a2e; margin-top: 1rem; margin-bottom: 0.5rem;">
-                    CER (Character Error Rate) <span style="color: #059669; font-size: 0.9rem;">↓ 낮을수록 좋음</span>
-                </p>
-                <ul style="color: #555; margin: 0; padding-left: 1.2rem; font-size: 0.9rem;">
-                    <li>문자 단위 오류율</li>
-                    <li>Error Injection: 어떤 문자가 누락/추가/변경되었는지 추적</li>
-                </ul>
-            </div>
-            <div>
-                <p style="font-size: 1.1rem; font-weight: 600; color: #1a1a2e; margin-bottom: 0.5rem;">
-                    BLEU Score <span style="color: #D97706; font-size: 0.9rem;">↑ 높을수록 좋음 (보조)</span>
-                </p>
-                <ul style="color: #555; margin: 0; padding-left: 1.2rem; font-size: 0.9rem;">
-                    <li>문장 유사도가 아닌 핵심 키워드 포함 여부 확인용</li>
-                    <li>n-gram 기반 정밀도 측정</li>
-                </ul>
+    with ov_col1:
+        st.markdown("**WER (Word Error Rate)** · :green[↓ 낮을수록 좋음]")
+        st.markdown("Mecab Tokenizer 기반 단어 단위 오류율. 삽입/삭제/대체 오류를 종합 측정.")
 
-                <p style="font-size: 1.1rem; font-weight: 600; color: #1a1a2e; margin-top: 1rem; margin-bottom: 0.5rem;">
-                    Latency <span style="color: #059669; font-size: 0.9rem;">↓ 낮을수록 좋음</span>
-                </p>
-                <ul style="color: #555; margin: 0; padding-left: 1.2rem; font-size: 0.9rem;">
-                    <li>문서 1건 기준 Parsing 처리 시간</li>
-                    <li>단위: milliseconds (ms)</li>
-                </ul>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        st.markdown("**CER (Character Error Rate)** · :green[↓ 낮을수록 좋음]")
+        st.markdown("문자 단위 오류율. 어떤 문자가 누락/추가/변경되었는지 추적.")
+
+    with ov_col2:
+        st.markdown("**BLEU Score** · :orange[↑ 높을수록 좋음 (보조)]")
+        st.markdown("핵심 키워드 포함 여부 확인용. n-gram 기반 정밀도 측정.")
+
+        st.markdown("**Latency** · :green[↓ 낮을수록 좋음]")
+        st.markdown("문서 1건 기준 Parsing 처리 시간 (ms).")
 
     st.markdown("---")
 
@@ -555,39 +530,44 @@ with tab_parsing:
         st.markdown(f"#### {test_data['id']}: {test_data['name']}")
         st.caption(f"📄 {test_data['doc_type']}")
 
-        # 메트릭 카드 (작게)
-        m1, m2, m3, m4 = st.columns(4)
+        # 전체 파서 비교 테이블 (컴팩트)
+        detail_rows = []
+        for parser, metrics in test_data["parsers"].items():
+            detail_rows.append({
+                "Parser": parser,
+                "WER ↓": f"{metrics['wer']:.3f}",
+                "CER ↓": f"{metrics['cer']:.3f}",
+                "BLEU ↑": f"{metrics['bleu']:.3f}",
+                "Latency ↓": f"{metrics['latency']:,}ms",
+            })
+        st.dataframe(
+            pd.DataFrame(detail_rows),
+            use_container_width=True, hide_index=True, height=145,
+        )
 
-        # VLM 기준으로 표시 (대표 파서)
-        vlm_metrics = test_data["parsers"]["VLM (Qwen3-VL)"]
+        # 가로형 Bar Chart (2x2 레이아웃)
+        chart_row1 = st.columns(2)
+        chart_row2 = st.columns(2)
 
-        m1.metric("WER", f"{vlm_metrics['wer']:.3f}", help="VLM 기준")
-        m2.metric("CER", f"{vlm_metrics['cer']:.3f}", help="VLM 기준")
-        m3.metric("BLEU", f"{vlm_metrics['bleu']:.3f}", help="VLM 기준")
-        m4.metric("Latency", f"{vlm_metrics['latency']:,}ms", help="VLM 기준")
-
-        # 가로형 Bar Chart
-        chart_cols = st.columns(4)
-
-        with chart_cols[0]:
+        with chart_row1[0]:
             st.plotly_chart(
                 create_thin_bar_chart(test_data, "wer", "WER", lower_is_better=True),
                 use_container_width=True
             )
 
-        with chart_cols[1]:
+        with chart_row1[1]:
             st.plotly_chart(
                 create_thin_bar_chart(test_data, "cer", "CER", lower_is_better=True),
                 use_container_width=True
             )
 
-        with chart_cols[2]:
+        with chart_row2[0]:
             st.plotly_chart(
                 create_thin_bar_chart(test_data, "bleu", "BLEU", lower_is_better=False),
                 use_container_width=True
             )
 
-        with chart_cols[3]:
+        with chart_row2[1]:
             st.plotly_chart(
                 create_thin_bar_chart(test_data, "latency", "Latency", lower_is_better=True),
                 use_container_width=True
