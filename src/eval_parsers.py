@@ -14,16 +14,16 @@ CLI 기반 Parser 테스트 스크립트
 
 Usage:
     # PDF 테스트
-    python -m src.test_parsers --input data/sample.pdf --gt data/ground_truth.md
+    python -m src.eval_parsers --input data/sample.pdf --gt data/ground_truth.md
 
     # 이미지 테스트 (VLM만)
-    python -m src.test_parsers --input data/image.png --gt data/ground_truth.md
+    python -m src.eval_parsers --input data/image.png --gt data/ground_truth.md
 
     # HWP/HWPX 테스트 (VLM만, LibreOffice 필요)
-    python -m src.test_parsers --input data/document.hwp --gt data/ground_truth.md
+    python -m src.eval_parsers --input data/document.hwp --gt data/ground_truth.md
 
     # 레거시 (--pdf 옵션도 지원)
-    python -m src.test_parsers --pdf data/sample.pdf
+    python -m src.eval_parsers --pdf data/sample.pdf
 """
 
 import argparse
@@ -42,8 +42,8 @@ import jiwer
 # Import Compatibility Layer
 # =============================================================================
 # 두 가지 실행 방식 모두 지원:
-#   1. python -m src.test_parsers (프로젝트 루트에서)
-#   2. python test_parsers.py (src/ 디렉토리에서)
+#   1. python -m src.eval_parsers (프로젝트 루트에서)
+#   2. python eval_parsers.py (src/ 디렉토리에서)
 
 def _import_parsers():
     """파서 모듈을 동적으로 임포트 (경로 호환성 처리)"""
@@ -62,7 +62,7 @@ def _import_parsers():
             from parsers.docling_parser import DoclingParser, check_docling_available
         except ImportError as e:
             print(f"❌ 파서 모듈을 찾을 수 없습니다: {e}")
-            print("   프로젝트 루트에서 실행하세요: python -m src.test_parsers")
+            print("   프로젝트 루트에서 실행하세요: python -m src.eval_parsers")
             sys.exit(1)
 
     return VLMParser, OCRParser, ImageOCRParser, DoclingParser, check_docling_available
@@ -606,8 +606,17 @@ def evaluate_results(results: dict, ground_truth: str, tokenizer=None, tokenizer
     return evaluation
 
 
-def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluation: dict = None, tokenizer_name: str = "whitespace"):
-    """파싱 결과를 파일로 저장"""
+def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluation: dict = None, tokenizer_name: str = "whitespace", metadata: dict = None):
+    """파싱 결과를 파일로 저장
+
+    Args:
+        results: 파서별 결과
+        output_dir: 출력 디렉토리
+        pdf_name: 입력 파일 경로
+        evaluation: 평가 결과 (CER, WER)
+        tokenizer_name: 토크나이저 이름
+        metadata: 테스트 메타데이터 (title, description, doc_type 등)
+    """
     from pathlib import Path
     import json
     from datetime import datetime
@@ -644,25 +653,36 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
         print(f"   ✓ {filename} ({len(save_content)} chars)")
 
     # 2. 평가 결과 JSON 저장
-    meta = {
+    eval_json = {
         "pdf": pdf_name,
         "timestamp": timestamp,
         "tokenizer": tokenizer_name,
         "results": {}
     }
+
+    # 메타데이터 추가
+    if metadata:
+        eval_json["metadata"] = {
+            "title": metadata.get("title", ""),
+            "description": metadata.get("description", ""),
+            "doc_type": metadata.get("doc_type", "unknown"),
+            "language": metadata.get("language", "unknown"),
+            "tags": metadata.get("tags", [])
+        }
+
     for name, result in results.items():
-        meta["results"][name] = {
+        eval_json["results"][name] = {
             "success": result.get("success"),
             "elapsed_time": result.get("elapsed_time"),
             "content_length": len(result.get("content", ""))
         }
         if evaluation and name in evaluation:
             eval_data = evaluation[name]
-            meta["results"][name]["cer"] = eval_data.get("cer")
-            meta["results"][name]["wer"] = eval_data.get("wer")
+            eval_json["results"][name]["cer"] = eval_data.get("cer")
+            eval_json["results"][name]["wer"] = eval_data.get("wer")
 
     meta_path = output_path / "evaluation.json"
-    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    meta_path.write_text(json.dumps(eval_json, indent=2, ensure_ascii=False), encoding="utf-8")
     print("   ✓ evaluation.json")
 
     # 3. 요약 마크다운 저장
@@ -738,6 +758,352 @@ def print_summary(results: dict, evaluation: dict = None):
 
 
 # =============================================================================
+# Data Folder Scanning
+# =============================================================================
+
+def extract_file_metadata(file_path: Path) -> dict:
+    """파일에서 자동으로 메타데이터 추출
+
+    Args:
+        file_path: 입력 파일 경로
+
+    Returns:
+        메타데이터 딕셔너리
+    """
+    import os
+
+    metadata = {
+        "filename": file_path.name,
+        "file_size_kb": round(file_path.stat().st_size / 1024, 1),
+        "doc_type": "unknown",
+        "pages": 0,
+        "title": file_path.stem,  # 확장자 제외한 파일명
+        "language": "unknown",
+        "has_text_layer": False,
+    }
+
+    # 파일 포맷 감지
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        metadata["doc_type"] = "PDF"
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                metadata["pages"] = len(pdf.pages)
+
+                # 텍스트 레이어 확인 (첫 페이지)
+                if pdf.pages:
+                    first_page_text = pdf.pages[0].extract_text() or ""
+                    # 의미있는 텍스트가 100자 이상이면 텍스트 레이어 있음
+                    metadata["has_text_layer"] = len(first_page_text.strip()) > 100
+
+        except Exception as e:
+            print(f"⚠️ PDF 메타데이터 추출 실패: {e}")
+
+    elif suffix in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]:
+        metadata["doc_type"] = "Image"
+        metadata["pages"] = 1
+        try:
+            from PIL import Image
+            with Image.open(file_path) as img:
+                metadata["image_size"] = f"{img.width}x{img.height}"
+        except Exception:
+            pass
+
+    elif suffix in [".hwp", ".hwpx"]:
+        metadata["doc_type"] = "HWP"
+        # HWP 메타데이터 추출은 복잡하므로 기본값 사용
+
+    # 언어 감지 (파일명 기반 간단한 휴리스틱)
+    filename = file_path.name
+    if any(ord(c) >= 0xAC00 and ord(c) <= 0xD7A3 for c in filename):
+        metadata["language"] = "ko"
+    elif any(ord(c) >= 0x4E00 and ord(c) <= 0x9FFF for c in filename):
+        metadata["language"] = "zh"
+    elif any(ord(c) >= 0x3040 and ord(c) <= 0x30FF for c in filename):
+        metadata["language"] = "ja"
+    else:
+        metadata["language"] = "en"  # 기본값
+
+    return metadata
+
+
+def load_test_metadata(folder_path: Path, input_file: Optional[Path] = None) -> dict:
+    """테스트 폴더의 메타데이터 로드 (파일에서 자동 추출)
+
+    Args:
+        folder_path: data/test_* 폴더 경로
+        input_file: 입력 파일 경로 (있으면 파일에서 메타데이터 추출)
+
+    Returns:
+        메타데이터 딕셔너리
+    """
+    # 입력 파일이 있으면 자동 추출
+    if input_file and input_file.exists():
+        return extract_file_metadata(input_file)
+
+    # 폴더에서 입력 파일 찾기
+    input_extensions = [".pdf", ".png", ".jpg", ".jpeg", ".hwp", ".hwpx"]
+    for ext in input_extensions:
+        for f in folder_path.glob(f"*{ext}"):
+            if not f.name.startswith("gt_"):
+                return extract_file_metadata(f)
+
+    # 기본값 반환
+    return {
+        "filename": "unknown",
+        "file_size_kb": 0,
+        "doc_type": "unknown",
+        "pages": 0,
+        "title": folder_path.name,
+        "language": "unknown",
+        "has_text_layer": False,
+    }
+
+
+def scan_data_folders(data_dir: Path = Path("data")) -> List[dict]:
+    """data/ 폴더의 모든 test_* 폴더를 스캔하여 테스트 정보 반환
+
+    Returns:
+        List of dicts with keys: test_id, input_file, gt_file, folder_path, metadata
+    """
+    test_folders = []
+
+    if not data_dir.exists():
+        print(f"❌ 데이터 폴더를 찾을 수 없습니다: {data_dir}")
+        return []
+
+    # test_* 패턴의 폴더 찾기
+    for folder in sorted(data_dir.iterdir()):
+        if not folder.is_dir() or not folder.name.startswith("test_"):
+            continue
+
+        test_id = folder.name
+        input_file = None
+        gt_file = None
+
+        # 입력 파일 찾기 (PDF, 이미지, HWP 등)
+        for f in folder.iterdir():
+            if f.is_file():
+                fmt = detect_file_format(f)
+                if fmt != FileFormat.UNKNOWN and not f.name.startswith("gt_"):
+                    input_file = f
+                elif f.name.startswith("gt_") and f.suffix in [".md", ".txt"]:
+                    gt_file = f
+
+        if input_file:
+            # 파일에서 메타데이터 자동 추출
+            metadata = load_test_metadata(folder, input_file)
+
+            test_folders.append({
+                "test_id": test_id,
+                "input_file": input_file,
+                "gt_file": gt_file,
+                "folder_path": folder,
+                "metadata": metadata
+            })
+        else:
+            print(f"⚠️ {test_id}: 입력 파일을 찾을 수 없습니다")
+
+    return test_folders
+
+
+def run_single_test(
+    input_path: Path,
+    gt_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    skip_vlm: bool = False,
+    skip_docling: bool = False,
+    verbose: bool = False,
+    tokenizer_type: str = "whitespace",
+    dpi: int = 150,
+    metadata: dict = None
+) -> dict:
+    """단일 파일 파싱 테스트 실행
+
+    Args:
+        metadata: 테스트 메타데이터 (title, description, doc_type 등)
+
+    Returns:
+        dict with keys: results, evaluation
+    """
+    file_format = detect_file_format(input_path)
+    input_bytes = input_path.read_bytes()
+
+    print("=" * 60)
+    print("🔬 VLM Document Parsing Quality Test")
+    print("=" * 60)
+    print(f"📄 입력 파일: {input_path}")
+    print(f"📁 포맷: {file_format.value.upper()}")
+    print(f"📦 크기: {len(input_bytes) / 1024:.1f} KB")
+
+    if file_format == FileFormat.UNKNOWN:
+        print("❌ 지원하지 않는 파일 포맷입니다.")
+        return {"results": {}, "evaluation": None}
+
+    # Ground Truth 읽기
+    ground_truth = None
+    if gt_path and gt_path.exists():
+        ground_truth = gt_path.read_text(encoding="utf-8")
+        print(f"📋 Ground Truth: {gt_path} ({len(ground_truth)} chars)")
+
+    results = {}
+
+    # HWP/HWPX 전처리
+    hwp_images = None
+    if file_format in [FileFormat.HWP, FileFormat.HWPX]:
+        print("\n📄 HWP/HWPX 변환 시작...")
+        hwp_images = convert_hwp_to_images(input_path, dpi=dpi)
+        if not hwp_images:
+            print("❌ HWP → 이미지 변환 실패")
+            return {"results": {}, "evaluation": None}
+
+    # 포맷별 테스트
+    if file_format == FileFormat.PDF:
+        if not skip_vlm:
+            try:
+                results["VLM"] = test_vlm_parser(input_bytes, verbose, FileFormat.PDF)
+            except Exception as e:
+                print(f"❌ VLM Parser 오류: {e}")
+                results["VLM"] = {"success": False, "error": str(e)}
+
+        try:
+            results["OCR-Text"] = test_ocr_text_parser(input_bytes, verbose)
+        except Exception as e:
+            print(f"❌ OCR-Text Parser 오류: {e}")
+            results["OCR-Text"] = {"success": False, "error": str(e)}
+
+        if not skip_docling:
+            try:
+                results["OCR-Image"] = test_ocr_image_parser(input_bytes, verbose)
+            except Exception as e:
+                print(f"❌ OCR-Image Parser 오류: {e}")
+                results["OCR-Image"] = {"success": False, "error": str(e)}
+
+    elif file_format == FileFormat.IMAGE:
+        print("\n⚠️ 이미지 입력: VLM Parser만 테스트합니다")
+        if not skip_vlm:
+            try:
+                results["VLM"] = test_vlm_parser(input_bytes, verbose, FileFormat.IMAGE)
+            except Exception as e:
+                print(f"❌ VLM Parser 오류: {e}")
+                results["VLM"] = {"success": False, "error": str(e)}
+
+    elif file_format in [FileFormat.HWP, FileFormat.HWPX]:
+        print("\n⚠️ HWP/HWPX 입력: VLM Parser만 테스트합니다")
+        if not skip_vlm:
+            try:
+                results["VLM"] = test_vlm_parser(
+                    input_bytes, verbose, file_format, pre_converted_images=hwp_images
+                )
+            except Exception as e:
+                print(f"❌ VLM Parser 오류: {e}")
+                results["VLM"] = {"success": False, "error": str(e)}
+
+    # 평가
+    evaluation = None
+    if ground_truth:
+        tokenizer = get_tokenizer(tokenizer_type)
+        evaluation = evaluate_results(results, ground_truth, tokenizer, tokenizer_type)
+
+    # 결과 저장
+    if output_dir:
+        save_results_to_files(results, str(output_dir), str(input_path), evaluation, tokenizer_type, metadata)
+
+    print_summary(results, evaluation)
+
+    return {"results": results, "evaluation": evaluation}
+
+
+def run_all_tests(
+    data_dir: Path = Path("data"),
+    results_dir: Path = Path("results"),
+    skip_vlm: bool = False,
+    skip_docling: bool = False,
+    verbose: bool = False,
+    tokenizer_type: str = "whitespace",
+    dpi: int = 150
+) -> dict:
+    """data/ 폴더의 모든 테스트 실행
+
+    Returns:
+        dict mapping test_id to test results
+    """
+    test_folders = scan_data_folders(data_dir)
+
+    if not test_folders:
+        print("❌ 테스트할 데이터가 없습니다.")
+        return {}
+
+    print("=" * 60)
+    print("🔬 VLM Document Parsing - Batch Test")
+    print("=" * 60)
+    print(f"📁 데이터 폴더: {data_dir}")
+    print(f"📊 테스트 수: {len(test_folders)}")
+    print()
+
+    for info in test_folders:
+        fmt = detect_file_format(info["input_file"])
+        gt_status = "✓" if info["gt_file"] else "✗"
+        print(f"  - {info['test_id']}: {info['input_file'].name} ({fmt.value}) [GT: {gt_status}]")
+
+    print()
+
+    all_results = {}
+
+    for i, info in enumerate(test_folders, 1):
+        test_id = info["test_id"]
+        print()
+        print("#" * 60)
+        print(f"# [{i}/{len(test_folders)}] {test_id}")
+        print("#" * 60)
+
+        output_dir = results_dir / test_id
+
+        result = run_single_test(
+            input_path=info["input_file"],
+            gt_path=info["gt_file"],
+            output_dir=output_dir,
+            skip_vlm=skip_vlm,
+            skip_docling=skip_docling,
+            verbose=verbose,
+            tokenizer_type=tokenizer_type,
+            dpi=dpi,
+            metadata=info.get("metadata")
+        )
+
+        all_results[test_id] = result
+
+    # 전체 요약
+    print()
+    print("=" * 60)
+    print("📊 전체 테스트 요약")
+    print("=" * 60)
+
+    print(f"\n| Test ID | Format | VLM CER | OCR-Text CER | OCR-Image CER |")
+    print(f"|---------|--------|---------|--------------|---------------|")
+
+    for test_id, result in all_results.items():
+        eval_data = result.get("evaluation", {}) or {}
+
+        vlm_cer = eval_data.get("VLM", {}).get("cer")
+        ocr_text_cer = eval_data.get("OCR-Text", {}).get("cer")
+        ocr_image_cer = eval_data.get("OCR-Image", {}).get("cer")
+
+        vlm_str = f"{vlm_cer*100:.1f}%" if vlm_cer is not None else "N/A"
+        ocr_text_str = f"{ocr_text_cer*100:.1f}%" if ocr_text_cer is not None else "N/A"
+        ocr_image_str = f"{ocr_image_cer*100:.1f}%" if ocr_image_cer is not None else "N/A"
+
+        # 포맷 정보
+        test_info = next((t for t in test_folders if t["test_id"] == test_id), None)
+        fmt = detect_file_format(test_info["input_file"]).value if test_info else "?"
+
+        print(f"| {test_id:<8} | {fmt:<6} | {vlm_str:<7} | {ocr_text_str:<12} | {ocr_image_str:<13} |")
+
+    return all_results
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -752,14 +1118,24 @@ def main():
   HWP/HWPX  : 한글 문서 (LibreOffice로 변환 후 VLM)
 
 예시:
-  python -m src.test_parsers --input data/test.pdf --gt data/gt.md
-  python -m src.test_parsers --input data/receipt.png --gt data/gt.md
-  python -m src.test_parsers --input data/document.hwp --gt data/gt.md
+  # 전체 테스트 (data/ 폴더의 모든 test_* 스캔)
+  python -m src.eval_parsers --all
+
+  # 단일 파일 테스트
+  python -m src.eval_parsers --input data/test_1/test.pdf --gt data/test_1/gt.md
+
+  # 특정 데이터 폴더 지정
+  python -m src.eval_parsers --all --data-dir ./my_data
         """
     )
 
-    # 입력 파일 (--input 또는 레거시 --pdf)
+    # 입력 모드 (--all 또는 --input)
     input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--all", "-a",
+        action="store_true",
+        help="data/ 폴더의 모든 test_* 폴더 테스트"
+    )
     input_group.add_argument(
         "--input", "-i",
         help="테스트할 입력 파일 (PDF, 이미지, HWP/HWPX)"
@@ -770,8 +1146,20 @@ def main():
     )
 
     parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="테스트 데이터 폴더 (기본: data/)"
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("results"),
+        help="결과 저장 폴더 (기본: results/)"
+    )
+    parser.add_argument(
         "--gt", "-g",
-        help="Ground Truth 파일 경로 (선택)"
+        help="Ground Truth 파일 경로 (--input 사용 시)"
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -790,18 +1178,13 @@ def main():
     )
     parser.add_argument(
         "--output-dir", "-o",
-        help="파싱 결과를 저장할 디렉토리"
-    )
-    parser.add_argument(
-        "--save-docs",
-        action="store_true",
-        help="결과를 docs/Parsing_test_<일자>/ 폴더에 저장"
+        help="파싱 결과를 저장할 디렉토리 (--input 사용 시)"
     )
     parser.add_argument(
         "--tokenizer", "-t",
         choices=["whitespace", "mecab", "okt"],
         default="whitespace",
-        help="WER 계산용 토크나이저 (기본: whitespace, 한국어: mecab 또는 okt)"
+        help="WER 계산용 토크나이저 (기본: whitespace)"
     )
     parser.add_argument(
         "--dpi",
@@ -812,135 +1195,38 @@ def main():
 
     args = parser.parse_args()
 
-    # --save-docs 옵션 처리
-    if args.save_docs:
-        from datetime import datetime
-        date_str = datetime.now().strftime("%Y%m%d")
-        args.output_dir = f"docs/Parsing_test_{date_str}"
+    # --all 모드: 전체 테스트
+    if args.all:
+        run_all_tests(
+            data_dir=args.data_dir,
+            results_dir=args.results_dir,
+            skip_vlm=args.skip_vlm,
+            skip_docling=args.skip_docling,
+            verbose=args.verbose,
+            tokenizer_type=args.tokenizer,
+            dpi=args.dpi
+        )
+        return
 
-    # 입력 파일 경로 결정 (--input 우선, --pdf는 레거시)
+    # 단일 파일 모드
     input_path = Path(args.input if args.input else args.pdf)
     if not input_path.exists():
         print(f"❌ 파일을 찾을 수 없습니다: {input_path}")
         sys.exit(1)
 
-    # 파일 포맷 감지
-    file_format = detect_file_format(input_path)
+    gt_path = Path(args.gt) if args.gt else None
+    output_dir = Path(args.output_dir) if args.output_dir else None
 
-    print("=" * 60)
-    print("🔬 VLM Document Parsing Quality Test")
-    print("=" * 60)
-    print(f"📄 입력 파일: {input_path}")
-    print(f"📁 포맷: {file_format.value.upper()}")
-
-    input_bytes = input_path.read_bytes()
-    print(f"📦 크기: {len(input_bytes) / 1024:.1f} KB")
-
-    # 지원하지 않는 포맷 체크
-    if file_format == FileFormat.UNKNOWN:
-        print("❌ 지원하지 않는 파일 포맷입니다.")
-        print("   지원 포맷: PDF, PNG, JPG, JPEG, HWP, HWPX")
-        sys.exit(1)
-
-    # Ground Truth 읽기 (선택)
-    ground_truth = None
-    if args.gt:
-        gt_path = Path(args.gt)
-        if gt_path.exists():
-            ground_truth = gt_path.read_text(encoding="utf-8")
-            print(f"📋 Ground Truth: {gt_path} ({len(ground_truth)} chars)")
-        else:
-            print(f"⚠️ Ground Truth 파일을 찾을 수 없습니다: {gt_path}")
-
-    results = {}
-
-    # HWP/HWPX 전처리 (이미지로 변환)
-    hwp_images = None
-    if file_format in [FileFormat.HWP, FileFormat.HWPX]:
-        print("\n📄 HWP/HWPX 변환 시작...")
-        hwp_images = convert_hwp_to_images(input_path, dpi=args.dpi)
-
-        if not hwp_images:
-            print("❌ HWP → 이미지 변환 실패. LibreOffice 설치를 확인하세요.")
-            sys.exit(1)
-
-    # ==========================================================================
-    # 포맷별 테스트 분기
-    # ==========================================================================
-
-    if file_format == FileFormat.PDF:
-        # PDF: 모든 파서 테스트
-
-        # 1. VLM Parser
-        if not args.skip_vlm:
-            try:
-                results["VLM"] = test_vlm_parser(
-                    input_bytes, args.verbose, FileFormat.PDF
-                )
-            except Exception as e:
-                print(f"❌ VLM Parser 오류: {e}")
-                results["VLM"] = {"success": False, "error": str(e)}
-
-        # 2. OCR Parser (Text)
-        try:
-            results["OCR-Text"] = test_ocr_text_parser(input_bytes, args.verbose)
-        except Exception as e:
-            print(f"❌ OCR-Text Parser 오류: {e}")
-            results["OCR-Text"] = {"success": False, "error": str(e)}
-
-        # 3. OCR Parser (Image - Docling)
-        if not args.skip_docling:
-            try:
-                results["OCR-Image"] = test_ocr_image_parser(input_bytes, args.verbose)
-            except Exception as e:
-                print(f"❌ OCR-Image Parser 오류: {e}")
-                results["OCR-Image"] = {"success": False, "error": str(e)}
-
-    elif file_format == FileFormat.IMAGE:
-        # 이미지: VLM만 테스트
-        print("\n⚠️ 이미지 입력: VLM Parser만 테스트합니다 (OCR 파서는 PDF 전용)")
-
-        if args.skip_vlm:
-            print("❌ --skip-vlm 옵션이 설정되어 테스트할 파서가 없습니다.")
-            sys.exit(1)
-
-        try:
-            results["VLM"] = test_vlm_parser(
-                input_bytes, args.verbose, FileFormat.IMAGE
-            )
-        except Exception as e:
-            print(f"❌ VLM Parser 오류: {e}")
-            results["VLM"] = {"success": False, "error": str(e)}
-
-    elif file_format in [FileFormat.HWP, FileFormat.HWPX]:
-        # HWP/HWPX: VLM만 테스트 (이미지로 변환됨)
-        print("\n⚠️ HWP/HWPX 입력: VLM Parser만 테스트합니다")
-
-        if args.skip_vlm:
-            print("❌ --skip-vlm 옵션이 설정되어 테스트할 파서가 없습니다.")
-            sys.exit(1)
-
-        try:
-            results["VLM"] = test_vlm_parser(
-                input_bytes, args.verbose, file_format,
-                pre_converted_images=hwp_images
-            )
-        except Exception as e:
-            print(f"❌ VLM Parser 오류: {e}")
-            results["VLM"] = {"success": False, "error": str(e)}
-
-    # 평가 (Ground Truth가 있는 경우)
-    evaluation = None
-    if ground_truth:
-        tokenizer = get_tokenizer(args.tokenizer)
-        evaluation = evaluate_results(results, ground_truth, tokenizer, args.tokenizer)
-
-    # 결과 파일 저장 (--output-dir 또는 --save-docs 옵션)
-    if args.output_dir:
-        save_results_to_files(results, args.output_dir, str(input_path), evaluation, args.tokenizer)
-
-    # 요약 출력
-    print_summary(results, evaluation)
+    run_single_test(
+        input_path=input_path,
+        gt_path=gt_path,
+        output_dir=output_dir,
+        skip_vlm=args.skip_vlm,
+        skip_docling=args.skip_docling,
+        verbose=args.verbose,
+        tokenizer_type=args.tokenizer,
+        dpi=args.dpi
+    )
 
 
 if __name__ == "__main__":

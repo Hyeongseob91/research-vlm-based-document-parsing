@@ -268,6 +268,138 @@ class MockLLMClient:
 
 
 # =============================================================================
+# OpenAI Client for Perplexity Calculation
+# =============================================================================
+
+class OpenAIClient:
+    """OpenAI API client for perplexity calculation using chat completions.
+
+    Uses GPT-4o or other models that support logprobs in chat completions.
+    """
+
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        api_key: Optional[str] = None,
+        timeout: float = 60.0
+    ):
+        """Initialize OpenAI client.
+
+        Args:
+            model: OpenAI model ID (e.g., "gpt-4o", "gpt-4o-mini")
+            api_key: OpenAI API key (reads from OPENAI_API_KEY env var if not provided)
+            timeout: Request timeout in seconds
+        """
+        import os
+        self.model = model
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.timeout = timeout
+
+        if not self.api_key:
+            raise ValueError(
+                "OpenAI API key required. Set OPENAI_API_KEY environment variable "
+                "or pass api_key parameter."
+            )
+
+    def calculate_perplexity(
+        self,
+        text: str,
+        context: Optional[str] = None
+    ) -> float:
+        """Calculate perplexity using OpenAI chat completions with logprobs.
+
+        Args:
+            text: Target text to calculate perplexity for
+            context: Optional context to condition on
+
+        Returns:
+            Perplexity value (lower = more predictable)
+        """
+        if not text.strip():
+            return 1.0
+
+        # Build messages
+        messages = []
+        if context:
+            messages.append({
+                "role": "system",
+                "content": "You are analyzing text continuity. Given the context, evaluate how the following text continues."
+            })
+            messages.append({
+                "role": "user",
+                "content": f"Context:\n{context}\n\nText to evaluate:\n{text}"
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": f"Evaluate this text:\n{text}"
+            })
+
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "max_tokens": 1,
+                        "logprobs": True,
+                        "top_logprobs": 5,
+                    }
+                )
+                response.raise_for_status()
+                result = response.json()
+
+                # Extract logprobs from response
+                choices = result.get("choices", [])
+                if not choices:
+                    return 1.0
+
+                logprobs_data = choices[0].get("logprobs", {})
+                content_logprobs = logprobs_data.get("content", [])
+
+                if not content_logprobs:
+                    # Fallback: use simple heuristic based on response
+                    return 10.0  # Default moderate perplexity
+
+                # Calculate perplexity from logprobs
+                total_logprob = sum(
+                    item.get("logprob", 0)
+                    for item in content_logprobs
+                    if item.get("logprob") is not None
+                )
+
+                if len(content_logprobs) > 0:
+                    avg_neg_log_prob = -total_logprob / len(content_logprobs)
+                    perplexity = math.exp(avg_neg_log_prob)
+                else:
+                    perplexity = 1.0
+
+                return perplexity
+
+        except Exception as e:
+            print(f"Warning: OpenAI perplexity calculation failed: {e}")
+            return 1.0
+
+    def calculate_perplexity_batch(
+        self,
+        texts: list[str],
+        contexts: Optional[list[Optional[str]]] = None
+    ) -> list[float]:
+        """Calculate perplexity for multiple texts."""
+        if contexts is None:
+            contexts = [None] * len(texts)
+        return [
+            self.calculate_perplexity(text, context)
+            for text, context in zip(texts, contexts)
+        ]
+
+
+# =============================================================================
 # BC (Boundary Clarity) Calculation
 # =============================================================================
 
