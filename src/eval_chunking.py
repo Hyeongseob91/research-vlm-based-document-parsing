@@ -10,19 +10,19 @@ Reference: MoC Paper (arXiv:2503.09600v2)
 
 Usage:
     # Basic evaluation with PDF input
-    python -m src.test_chunking --input data/test.pdf
+    python -m src.eval_chunking --input data/test.pdf
 
     # With specific chunking strategy
-    python -m src.test_chunking --input data/test.pdf --strategy recursive_character
+    python -m src.eval_chunking --input data/test.pdf --strategy recursive_character
 
     # With existing parsed files
-    python -m src.test_chunking --parsed-dir results/parsing/test_1/
+    python -m src.eval_chunking --parsed-dir results/parsing/test_1/
 
     # Skip VLM parser (use only OCR)
-    python -m src.test_chunking --input data/test.pdf --skip-vlm
+    python -m src.eval_chunking --input data/test.pdf --skip-vlm
 
     # Full evaluation with CS graph
-    python -m src.test_chunking --input data/test.pdf --graph-type complete --threshold-k 0.7
+    python -m src.eval_chunking --input data/test.pdf --graph-type complete --threshold-k 0.7
 """
 
 import argparse
@@ -36,8 +36,8 @@ from typing import Optional
 # Import Compatibility Layer
 # =============================================================================
 # 두 가지 실행 방식 모두 지원:
-#   1. python -m src.test_chunking (프로젝트 루트에서)
-#   2. python test_chunking.py (src/ 디렉토리에서)
+#   1. python -m src.eval_chunking (프로젝트 루트에서)
+#   2. python eval_chunking.py (src/ 디렉토리에서)
 
 try:
     # 방법 1: src.xxx (프로젝트 루트에서 실행)
@@ -50,10 +50,11 @@ try:
     from src.chunking.metrics import (
         LLMClient,
         MockLLMClient,
+        OpenAIClient,
         evaluate_chunking,
         ChunkingMetrics,
     )
-    from src.test_parsers import (
+    from src.eval_parsers import (
         FileFormat,
         detect_file_format,
         test_vlm_parser,
@@ -72,10 +73,11 @@ except ImportError:
     from chunking.metrics import (
         LLMClient,
         MockLLMClient,
+        OpenAIClient,
         evaluate_chunking,
         ChunkingMetrics,
     )
-    from test_parsers import (
+    from eval_parsers import (
         FileFormat,
         detect_file_format,
         test_vlm_parser,
@@ -91,7 +93,7 @@ except ImportError:
 
 def chunk_text(
     text: str,
-    strategy: ChunkingStrategy = ChunkingStrategy.RECURSIVE_CHARACTER,
+    strategy: ChunkingStrategy = ChunkingStrategy.SEMANTIC,
     chunk_size: int = 500,
     chunk_overlap: int = 50,
     document_id: str = "doc"
@@ -120,7 +122,7 @@ def chunk_text(
 
 def parse_and_chunk(
     input_path: Path,
-    strategy: ChunkingStrategy = ChunkingStrategy.RECURSIVE_CHARACTER,
+    strategy: ChunkingStrategy = ChunkingStrategy.SEMANTIC,
     chunk_size: int = 500,
     chunk_overlap: int = 50,
     skip_vlm: bool = False,
@@ -374,92 +376,290 @@ def print_comparison_table(evaluation: dict[str, ChunkingMetrics]):
 # Output
 # =============================================================================
 
-def save_results(
+def save_chunking_json(
     chunk_results: dict[str, list[Chunk]],
     evaluation: dict[str, ChunkingMetrics],
     output_dir: Path,
     config: dict
 ):
-    """Save evaluation results to files.
+    """Save chunking evaluation results to chunking.json
 
     Args:
         chunk_results: Chunked results per parser
         evaluation: Evaluation metrics per parser
-        output_dir: Output directory
+        output_dir: Output directory (same as parsing results)
         config: Configuration used for this run
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 1. Save chunks as JSON for each parser
-    for parser_name, chunks in chunk_results.items():
-        safe_name = parser_name.lower().replace("-", "_")
-        chunks_file = output_dir / f"{safe_name}_chunks.json"
-
-        chunks_data = [c.to_dict() for c in chunks]
-        chunks_file.write_text(
-            json.dumps(chunks_data, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
-        print(f"  Saved: {chunks_file.name}")
-
-    # 2. Save evaluation results
-    eval_data = {
+    # Build chunking.json structure
+    chunking_data = {
         "timestamp": timestamp,
         "config": config,
         "results": {}
     }
 
     for parser_name, metrics in evaluation.items():
-        eval_data["results"][parser_name] = metrics.to_dict()
+        chunks = chunk_results.get(parser_name, [])
 
-    eval_file = output_dir / "evaluation.json"
-    eval_file.write_text(
-        json.dumps(eval_data, indent=2, ensure_ascii=False),
+        parser_result = {
+            "chunk_count": len(chunks),
+            "chunks": [c.to_dict() for c in chunks],
+        }
+
+        if metrics.bc_score:
+            parser_result["bc"] = {
+                "score": metrics.bc_score.score,
+                "min": metrics.bc_score.min_score,
+                "max": metrics.bc_score.max_score,
+                "std": metrics.bc_score.std_dev,
+                "pair_count": metrics.bc_score.pair_count,
+            }
+
+        if metrics.cs_score:
+            parser_result["cs"] = {
+                "score": metrics.cs_score.score,
+                "graph_type": metrics.cs_score.graph_type,
+                "node_count": metrics.cs_score.node_count,
+                "edge_count": metrics.cs_score.edge_count,
+                "threshold_k": metrics.cs_score.threshold_k,
+            }
+
+        chunking_data["results"][parser_name] = parser_result
+
+    # Save to chunking.json
+    chunking_file = output_dir / "chunking.json"
+    chunking_file.write_text(
+        json.dumps(chunking_data, indent=2, ensure_ascii=False),
         encoding="utf-8"
     )
-    print(f"  Saved: {eval_file.name}")
+    print(f"  ✓ Saved: {chunking_file}")
 
-    # 3. Save summary README
-    readme_lines = [
-        "# Chunking Evaluation Results",
-        "",
-        f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-        "## Configuration",
-        "",
-        f"- Strategy: {config.get('strategy', 'recursive_character')}",
-        f"- Chunk Size: {config.get('chunk_size', 500)}",
-        f"- Chunk Overlap: {config.get('chunk_overlap', 50)}",
-        f"- Graph Type: {config.get('graph_type', 'incomplete')}",
-        f"- Threshold K: {config.get('threshold_k', 0.8)}",
-        "",
-        "## Results",
-        "",
-        "| Parser | BC (↑) | CS (↓) | Chunks |",
-        "|--------|--------|--------|--------|",
-    ]
+    return chunking_file
 
-    for parser_name, metrics in evaluation.items():
-        bc_str = f"{metrics.bc_score.score:.4f}" if metrics.bc_score else "N/A"
-        cs_str = f"{metrics.cs_score.score:.4f}" if metrics.cs_score else "N/A"
-        chunk_count = metrics.bc_score.pair_count + 1 if metrics.bc_score else 0
-        readme_lines.append(f"| {parser_name} | {bc_str} | {cs_str} | {chunk_count} |")
 
-    readme_lines.extend([
-        "",
-        "## Metrics Explanation",
-        "",
-        "- **BC (Boundary Clarity)**: Higher is better. Measures chunk independence.",
-        "- **CS (Chunk Stickiness)**: Lower is better. Measures inter-chunk dependency.",
-        "",
-        "Reference: MoC Paper (arXiv:2503.09600v2)",
-    ])
+# =============================================================================
+# Batch Processing
+# =============================================================================
 
-    readme_file = output_dir / "README.md"
-    readme_file.write_text("\n".join(readme_lines), encoding="utf-8")
-    print(f"  Saved: {readme_file.name}")
+def scan_results_folders(results_dir: Path = Path("results")) -> list[dict]:
+    """Scan results/ folder for all test_* folders with parsing results.
+
+    Returns:
+        List of dicts with keys: test_id, folder_path, parsers
+    """
+    test_folders = []
+
+    if not results_dir.exists():
+        print(f"❌ 결과 폴더를 찾을 수 없습니다: {results_dir}")
+        return []
+
+    for folder in sorted(results_dir.iterdir()):
+        if not folder.is_dir() or not folder.name.startswith("test_"):
+            continue
+
+        test_id = folder.name
+
+        # Check for parsing results
+        evaluation_file = folder / "evaluation.json"
+        if not evaluation_file.exists():
+            print(f"⚠️ {test_id}: evaluation.json 없음 (파싱 먼저 실행 필요)")
+            continue
+
+        # Find parsed output files
+        parsers = []
+        for pattern in ["vlm", "ocr-text", "ocr-image"]:
+            for ext in [".txt", ".md"]:
+                output_file = folder / f"{pattern}_output{ext}"
+                if output_file.exists():
+                    content = output_file.read_text(encoding="utf-8")
+                    if len(content.strip()) > 0:
+                        parsers.append({
+                            "name": pattern.upper().replace("-", "_"),
+                            "file": output_file,
+                            "content_length": len(content)
+                        })
+                    break
+
+        if parsers:
+            test_folders.append({
+                "test_id": test_id,
+                "folder_path": folder,
+                "parsers": parsers
+            })
+        else:
+            print(f"⚠️ {test_id}: 파싱 결과 파일 없음")
+
+    return test_folders
+
+
+def run_single_chunking_test(
+    test_folder: Path,
+    strategy: ChunkingStrategy = ChunkingStrategy.SEMANTIC,
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
+    llm_client=None,
+    threshold_k: float = 0.8,
+    graph_type: str = "incomplete",
+    calculate_cs: bool = True,
+    verbose: bool = False
+) -> dict:
+    """Run chunking evaluation on a single test folder.
+
+    Args:
+        test_folder: Path to results/test_X folder
+        Other args: Chunking configuration
+
+    Returns:
+        dict with chunk_results and evaluation
+    """
+    # Load parsed files
+    chunk_results = {}
+
+    for pattern, parser_name in [("vlm", "VLM"), ("ocr-text", "OCR-Text"), ("ocr-image", "OCR-Image")]:
+        for ext in [".txt", ".md"]:
+            output_file = test_folder / f"{pattern}_output{ext}"
+            if output_file.exists():
+                content = output_file.read_text(encoding="utf-8")
+                if len(content.strip()) > 100:  # Minimum content length
+                    chunks = chunk_text(
+                        content,
+                        strategy=strategy,
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap,
+                        document_id=pattern
+                    )
+                    chunk_results[parser_name] = chunks
+                    print(f"  {parser_name}: {len(chunks)} chunks")
+                break
+
+    if not chunk_results:
+        print("  ❌ No valid content to chunk")
+        return {"chunk_results": {}, "evaluation": {}}
+
+    # Evaluate
+    evaluation = evaluate_all(
+        chunk_results,
+        llm_client=llm_client,
+        threshold_k=threshold_k,
+        graph_type=graph_type,
+        calculate_cs=calculate_cs,
+        verbose=verbose
+    )
+
+    return {"chunk_results": chunk_results, "evaluation": evaluation}
+
+
+def run_all_chunking_tests(
+    results_dir: Path = Path("results"),
+    strategy: str = "semantic",
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
+    llm_model: str = "gpt-4o",
+    use_mock: bool = False,
+    threshold_k: float = 0.8,
+    graph_type: str = "incomplete",
+    skip_cs: bool = False,
+    verbose: bool = False,
+    openai_api_key: Optional[str] = None
+) -> dict:
+    """Run chunking evaluation on all test folders in results/.
+
+    Returns:
+        dict mapping test_id to results
+    """
+    test_folders = scan_results_folders(results_dir)
+
+    if not test_folders:
+        print("❌ 청킹 테스트할 데이터가 없습니다.")
+        print("   먼저 파싱 테스트를 실행하세요: python -m src.eval_parsers --all")
+        return {}
+
+    print("=" * 60)
+    print("🔬 Chunking Evaluation - Batch Test")
+    print("=" * 60)
+    print(f"📁 결과 폴더: {results_dir}")
+    print(f"📊 테스트 수: {len(test_folders)}")
+    print(f"📐 Strategy: {strategy}")
+    print(f"📏 Chunk Size: {chunk_size}, Overlap: {chunk_overlap}")
+    print()
+
+    for info in test_folders:
+        parser_names = [p["name"] for p in info["parsers"]]
+        print(f"  - {info['test_id']}: {', '.join(parser_names)}")
+
+    # Create LLM client
+    llm_client = create_llm_client(llm_model, None, use_mock, openai_api_key)
+    if use_mock:
+        print("\n⚠️ MockLLMClient 사용 (근사값)")
+    elif "gpt" in llm_model.lower():
+        print(f"\n🤖 OpenAI {llm_model} 사용")
+
+    all_results = {}
+    strat = ChunkingStrategy(strategy)
+
+    config = {
+        "strategy": strategy,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "graph_type": graph_type,
+        "threshold_k": threshold_k,
+        "llm_model": llm_model,
+        "use_mock": use_mock,
+    }
+
+    for i, info in enumerate(test_folders, 1):
+        test_id = info["test_id"]
+        folder = info["folder_path"]
+
+        print()
+        print("#" * 60)
+        print(f"# [{i}/{len(test_folders)}] {test_id}")
+        print("#" * 60)
+
+        result = run_single_chunking_test(
+            test_folder=folder,
+            strategy=strat,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            llm_client=llm_client,
+            threshold_k=threshold_k,
+            graph_type=graph_type,
+            calculate_cs=not skip_cs,
+            verbose=verbose
+        )
+
+        # Save chunking.json in the same folder
+        if result["evaluation"]:
+            save_chunking_json(
+                result["chunk_results"],
+                result["evaluation"],
+                folder,
+                config
+            )
+
+        all_results[test_id] = result
+
+    # Summary
+    print()
+    print("=" * 60)
+    print("📊 전체 Chunking 평가 요약")
+    print("=" * 60)
+
+    print(f"\n| Test ID | Parser | BC (↑) | CS (↓) | Chunks |")
+    print(f"|---------|--------|--------|--------|--------|")
+
+    for test_id, result in all_results.items():
+        evaluation = result.get("evaluation", {})
+        for parser_name, metrics in evaluation.items():
+            bc_str = f"{metrics.bc_score.score:.4f}" if metrics.bc_score else "N/A"
+            cs_str = f"{metrics.cs_score.score:.4f}" if metrics.cs_score else "N/A"
+            chunk_count = metrics.bc_score.pair_count + 1 if metrics.bc_score else 0
+            print(f"| {test_id:<8} | {parser_name:<6} | {bc_str:<6} | {cs_str:<6} | {chunk_count:<6} |")
+
+    return all_results
 
 
 # =============================================================================
@@ -469,14 +669,16 @@ def save_results(
 def create_llm_client(
     llm_model: str,
     llm_api_url: Optional[str] = None,
-    use_mock: bool = False
-) -> LLMClient | MockLLMClient:
+    use_mock: bool = False,
+    openai_api_key: Optional[str] = None
+) -> LLMClient | MockLLMClient | OpenAIClient:
     """Create LLM client based on configuration.
 
     Args:
         llm_model: Model identifier
         llm_api_url: API URL (optional, uses default if not provided)
         use_mock: Use mock client instead of real API
+        openai_api_key: OpenAI API key (for OpenAI models)
 
     Returns:
         LLM client instance
@@ -484,12 +686,18 @@ def create_llm_client(
     if use_mock:
         return MockLLMClient()
 
-    # Default API URLs based on model
+    # OpenAI models use the OpenAI client
+    openai_models = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
+    if llm_model.lower() in openai_models:
+        return OpenAIClient(
+            model=llm_model,
+            api_key=openai_api_key,
+        )
+
+    # Default API URLs based on model (local models)
     default_urls = {
         "qwen2.5-7b": "http://localhost:8000/v1/completions",
         "qwen2.5-14b": "http://localhost:8000/v1/completions",
-        "gpt-3.5-turbo": "https://api.openai.com/v1/completions",
-        "gpt-4": "https://api.openai.com/v1/completions",
     }
 
     api_url = llm_api_url or default_urls.get(llm_model.lower(), "http://localhost:8000/v1/completions")
@@ -510,14 +718,24 @@ Metrics:
   CS (Chunk Stickiness):  Lower is better - less inter-chunk dependency
 
 Examples:
-  python -m src.test_chunking --input data/test.pdf
-  python -m src.test_chunking --parsed-dir results/parsing/test_1/
-  python -m src.test_chunking --input data/test.pdf --use-mock
+  # 전체 테스트 (results/ 폴더의 모든 파싱 결과)
+  python -m src.eval_chunking --all
+
+  # 특정 테스트 폴더
+  python -m src.eval_chunking --parsed-dir results/test_1/
+
+  # 새 파일 파싱 후 청킹
+  python -m src.eval_chunking --input data/test.pdf --use-mock
         """
     )
 
     # Input options (mutually exclusive)
     input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--all", "-a",
+        action="store_true",
+        help="results/ 폴더의 모든 test_* 결과 청킹 테스트"
+    )
     input_group.add_argument(
         "--input", "-i",
         type=Path,
@@ -535,20 +753,26 @@ Examples:
         help="Specific parsed output files"
     )
 
-    # Output options
+    # Directory options
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("results"),
+        help="결과 폴더 (기본: results/)"
+    )
     parser.add_argument(
         "--output-dir", "-o",
         type=Path,
         default=None,
-        help="Output directory for results (default: results/chunks/<timestamp>)"
+        help="Output directory for results (--input 모드 전용)"
     )
 
     # Chunking options
     parser.add_argument(
         "--strategy",
         choices=["fixed", "recursive_character", "semantic", "hierarchical"],
-        default="recursive_character",
-        help="Chunking strategy (default: recursive_character)"
+        default="semantic",
+        help="Chunking strategy (default: semantic)"
     )
     parser.add_argument(
         "--strategies",
@@ -584,13 +808,18 @@ Examples:
     # LLM options
     parser.add_argument(
         "--llm-model",
-        default="qwen2.5-7b",
-        help="LLM model for perplexity calculation (default: qwen2.5-7b)"
+        default="gpt-4o",
+        help="LLM model for perplexity calculation (default: gpt-4o)"
     )
     parser.add_argument(
         "--llm-api-url",
         default=None,
         help="LLM API URL (default: auto-detect based on model)"
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        default=None,
+        help="OpenAI API key (or set OPENAI_API_KEY env var)"
     )
     parser.add_argument(
         "--use-mock",
@@ -625,6 +854,24 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # --all 모드: 전체 테스트
+    if args.all:
+        run_all_chunking_tests(
+            results_dir=args.results_dir,
+            strategy=args.strategy,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            llm_model=args.llm_model,
+            use_mock=args.use_mock,
+            threshold_k=args.threshold_k,
+            graph_type=args.graph_type,
+            skip_cs=args.skip_cs,
+            verbose=args.verbose,
+            openai_api_key=args.openai_api_key
+        )
+        print("\nDone!")
+        return
 
     # Print header
     print("=" * 60)
@@ -709,11 +956,14 @@ Examples:
     llm_client = create_llm_client(
         args.llm_model,
         args.llm_api_url,
-        args.use_mock
+        args.use_mock,
+        args.openai_api_key
     )
 
     if args.use_mock:
         print("\nNote: Using MockLLMClient (results are approximate)")
+    elif "gpt" in args.llm_model.lower():
+        print(f"\n🤖 Using OpenAI {args.llm_model}")
 
     # Evaluate
     evaluation = evaluate_all(
@@ -729,12 +979,8 @@ Examples:
     print_comparison_table(evaluation)
 
     # Save results
-    if args.output_dir or args.input:
-        output_dir = args.output_dir
-        if output_dir is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = Path("results/chunks") / timestamp
-
+    output_dir = args.output_dir or args.parsed_dir
+    if output_dir:
         config = {
             "strategy": args.strategy,
             "chunk_size": args.chunk_size,
@@ -746,7 +992,7 @@ Examples:
         }
 
         print(f"\nSaving results to: {output_dir}")
-        save_results(chunk_results, evaluation, output_dir, config)
+        save_chunking_json(chunk_results, evaluation, output_dir, config)
 
     print("\nDone!")
 

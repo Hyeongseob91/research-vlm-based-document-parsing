@@ -103,18 +103,18 @@ class VLMParser:
 
     PROMPT = """Transcribe the document image to Markdown. Output ONLY the text visible in the image.
 
-CRITICAL RULES:
-1. NEVER add ```markdown or ``` code fences
-2. NEVER add text that is not visible in the image
-3. NEVER summarize, explain, or comment
-4. Skip page numbers (like "- 7 -" or "page 1")
+    CRITICAL RULES:
+    1. NEVER add ```markdown or ``` code fences
+    2. NEVER add text that is not visible in the image
+    3. NEVER summarize, explain, or comment
+    4. Skip page numbers (like "- 7 -" or "page 1")
 
-FORMAT:
-- Use # ## ### for headers
-- Use | for tables
-- Use - for bullet lists
+    FORMAT:
+    - Use # ## ### for headers
+    - Use | for tables
+    - Use - for bullet lists
 
-START TRANSCRIPTION:"""
+    START TRANSCRIPTION:"""
 
     # ==========================================================================
     # Constructor

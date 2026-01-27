@@ -1,3 +1,8 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
 # Python
 __pycache__/
 *.py[cod]
@@ -14,6 +19,7 @@ eggs/
 .venv/
 venv/
 ENV/
+.env
 
 # uv
 .uv/
