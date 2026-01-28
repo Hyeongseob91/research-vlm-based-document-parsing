@@ -84,25 +84,38 @@ class TextStructurer:
     # Class Constants (Prompt for Text Structuring)
     # ==========================================================================
 
-    STRUCTURING_PROMPT = """You are a document structure expert. Convert the following OCR-extracted text into well-structured Markdown.
+    SYSTEM_PROMPT = """You are a Markdown formatting expert. Your task is to convert plain text into well-structured Markdown format.
 
-## Rules:
-1. **Headers**: Use # for main titles, ## for sections, ### for subsections
-2. **Tables**: Convert tabular data to Markdown tables with | separators
-3. **Lists**: Use - for bullet lists, 1. for numbered lists
-4. **Paragraphs**: Group related sentences into coherent paragraphs
-5. **Preserve**: Keep all original content, do not summarize or omit
+CRITICAL RULES - You MUST follow these:
+1. ALWAYS use # symbols for headings. This is mandatory.
+2. Document title → # Title
+3. Section numbers like "1 Introduction" or "1. Introduction" → ## 1. Introduction
+4. Subsections like "3.1 Method" → ### 3.1 Method
+5. Sub-subsections like "3.1.1 Details" → #### 3.1.1 Details
+6. Tables with aligned columns → Markdown table with | separators
+7. Bullet points → - item
+8. Numbered lists → 1. item
 
-## Important:
-- Fix obvious OCR errors (broken words, misplaced characters)
-- Preserve the original reading order and hierarchy
-- Output Markdown only, no explanations or comments
-- Do NOT add ```markdown code fences
+NEVER output plain text headings without # symbols."""
 
-## Input Text:
+    STRUCTURING_PROMPT = """Format this text as Markdown. Add # symbols to section headings.
+
+HEADING LEVELS (based on numbering depth):
+- Paper/document title (no number) → # Actual Title
+- Top sections (1, 2, 3...) → ## 1. Section Name
+- Subsections (2.1, 3.2...) → ### 2.1 Subsection
+- Sub-subsections (3.1.1, 4.2.1...) → #### 3.1.1 Name
+
+OTHER RULES:
+- Tables: use | col1 | col2 | with |---|---| separator
+- Lists: use - or 1.
+- PRESERVE all original text content exactly
+- Output Markdown only
+
+TEXT:
 {text}
 
-## Structured Output:"""
+OUTPUT:"""
 
     # ==========================================================================
     # Constructor
@@ -243,6 +256,10 @@ class TextStructurer:
         return {
             "model": self.model,
             "messages": [
+                {
+                    "role": "system",
+                    "content": self.SYSTEM_PROMPT
+                },
                 {
                     "role": "user",
                     "content": prompt
