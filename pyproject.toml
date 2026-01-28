@@ -1,7 +1,7 @@
 [project]
 name = "vlm-document-parsing-test"
 version = "0.2.0"
-description = "VLM Document Parsing Quality Evaluation Framework"
+description = "Document Parsing Structure Preservation Impact Evaluation Framework"
 requires-python = ">=3.11"
 dependencies = [
     "streamlit>=1.45.0",
