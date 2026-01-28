@@ -73,6 +73,24 @@ Traditional RAG pipelines rely heavily on plain text extraction, which fails to 
 | **RQ2** | Can VLM-based parsing preserve that structure? | BC (Boundary Clarity), CS (Chunk Stickiness) |
 | **RQ3** | Does structure preservation at parsing determine downstream (chunking, retrieval) quality? | Hit Rate@k, MRR |
 
+### Key Results
+
+<div align="center">
+
+<img src="docs/tech_report/figures/fig1_structure_f1_comparison.png" width="600" alt="Structure F1 Comparison: Baseline (0%) vs Advanced (~79%)">
+
+**Fig 1.** Baseline parsers preserve 0% of document structure, while VLM-based Advanced parsers achieve ~79% Structure F1.
+
+<br>
+
+<img src="docs/tech_report/figures/fig3_tradeoff_scatter.png" width="600" alt="Trade-off: CER vs Structure F1">
+
+**Fig 2.** Advanced parsers trade lexical accuracy (higher CER) for structure preservation (higher F1) — a worthwhile trade-off for RAG pipelines.
+
+</div>
+
+> For full experimental results and analysis, see the [Tech Report](docs/tech_report/).
+
 ---
 
 ## Key Features
