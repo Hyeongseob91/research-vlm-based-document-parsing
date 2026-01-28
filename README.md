@@ -13,10 +13,10 @@ A comprehensive evaluation framework for quantitatively analyzing the impact of 
 uv sync
 
 # Run parser comparison benchmark
-python -m src.test_parsers --pdf data/test_1/test_data_1.pdf --gt data/test_1/gt_data_1.md
+python -m src.eval_parsers --all
 
-# Run full evaluation pipeline
-python -m src.run_benchmark --config experiments/config.yaml
+# Run chunking evaluation
+python -m src.eval_chunking --all
 ```
 
 ---
@@ -30,8 +30,8 @@ python -m src.run_benchmark --config experiments/config.yaml
 - [Usage](#usage)
 - [Evaluation Metrics](#evaluation-metrics)
 - [Project Structure](#project-structure)
-- [Tech Report](#tech-report)
-- [Experimental Results](#experimental-results)
+- [Configuration](#configuration)
+- [API Reference](#api-reference)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -50,74 +50,97 @@ Traditional RAG pipelines rely heavily on plain text extraction, which fails to 
 
 ### Hypothesis
 
-> VLM-based parsing produces structured markdown that preserves document layout, leading to better semantic chunking boundaries (higher Boundary Score) and improved chunk coherence (higher Chunk Score), ultimately resulting in better retrieval accuracy.
+> VLM-based parsing produces structured markdown that preserves document layout, leading to better semantic chunking boundaries (higher Boundary Clarity) and improved chunk coherence (lower Chunk Stickiness), ultimately resulting in better retrieval accuracy.
 
 ### Core Research Questions
 
 | RQ | Question | Metrics |
 |----|----------|---------|
-| **RQ1** | Does VLM achieve better lexical accuracy? | CER, WER |
-| **RQ2** | Does VLM preserve structure better? | Boundary Score, Chunk Score |
+| **RQ1** | Does VLM achieve better lexical accuracy? | CER, WER, Structure F1 |
+| **RQ2** | Does VLM preserve structure better? | BC (Boundary Clarity), CS (Chunk Stickiness) |
 | **RQ3** | Does better parsing improve retrieval? | Hit Rate@k, MRR |
 
 ---
 
 ## Key Features
 
-### Multi-Parser Support
-- **VLM Parser** (Qwen3-VL): Structured markdown output with layout understanding
-- **pdfplumber**: Fast digital PDF text extraction
-- **Docling + RapidOCR**: Scanned document OCR
+### 4-Parser Architecture
+
+| Parser | Description | Stage 1 | Stage 2 |
+|--------|-------------|---------|---------|
+| **Text-Baseline** | Digital PDF text extraction | PyMuPDF | - |
+| **Image-Baseline** | Scanned PDF OCR | RapidOCR | - |
+| **Text-Advanced** | Digital + VLM structuring | PyMuPDF | VLM (Qwen3-VL) |
+| **Image-Advanced** | Scanned + VLM structuring | RapidOCR | VLM (Qwen3-VL) |
+
+### Semantic Chunking
+
+Uses LangChain's SemanticChunker with embedding-based boundary detection:
+
+- **Breakpoint Types**: percentile, standard_deviation, interquartile, gradient
+- **Embedding Backend**: BGE-M3 via Infinity API or local sentence-transformers
+- **Automatic Sizing**: Chunk size determined by semantic boundaries
+
+### MoC-based Quality Metrics (Label-Free)
+
+Based on the MoC paper (arXiv:2503.09600v2), using **Semantic Distance** instead of Perplexity:
+
+| Metric | Implementation | Interpretation |
+|--------|---------------|----------------|
+| **BC (Boundary Clarity)** | `1 - cosine_similarity(chunk_i, chunk_i+1)` | Higher = more independent (good) |
+| **CS (Chunk Stickiness)** | Structural Entropy of chunk graph | Lower = less dependency (good) |
+
+**Note**: Semantic Distance BC scores (0.3-0.5) differ from MoC's Perplexity-based scores (0.8+) due to different metric scales.
 
 ### Comprehensive Evaluation
-- **Lexical Metrics**: CER, WER with Korean morphological analysis (MeCab)
-- **Structural Metrics**: Boundary Score, Chunk Score
-- **Retrieval Metrics**: Hit Rate@k, MRR with statistical significance testing
-- **Error Analysis**: Automatic error detection, categorization, and case study generation
 
-### Research Infrastructure
-- **Tech Report Template**: Complete academic report structure
-- **Experiment Configuration**: YAML-based reproducible experiments
-- **Q&A Generation**: LLM-powered evaluation dataset creation
-- **Benchmark Runner**: Automated end-to-end evaluation pipeline
+- **Lexical Metrics**: CER, WER with Korean morphological analysis (MeCab)
+- **Structure Metrics**: Structure F1 (Precision, Recall for markdown elements)
+- **Chunking Metrics**: BC, CS without Ground Truth
+- **Retrieval Metrics**: Hit Rate@k, MRR with statistical significance testing
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Document Input                                │
-│                     (PDF / Image / Scan)                            │
-└───────────────────────────┬─────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Parsing Layer                                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
-│  │    VLM      │  │ pdfplumber  │  │   Docling   │                 │
-│  │ (Qwen3-VL)  │  │  (Digital)  │  │ (RapidOCR)  │                 │
-│  │  Markdown   │  │ Plain Text  │  │ Plain Text  │                 │
-│  └─────────────┘  └─────────────┘  └─────────────┘                 │
-└───────────────────────────┬─────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Chunking Layer                                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
-│  │   Fixed     │  │  Recursive  │  │  Semantic   │                 │
-│  │    Size     │  │  Character  │  │   (Topic)   │                 │
-│  └─────────────┘  └─────────────┘  └─────────────┘                 │
-└───────────────────────────┬─────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Evaluation Layer                                  │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
-│  │  Lexical  │  │ Structural│  │ Retrieval │  │   Error   │       │
-│  │ CER, WER  │  │  BS, CS   │  │ HR@k, MRR │  │ Analysis  │       │
-│  └───────────┘  └───────────┘  └───────────┘  └───────────┘       │
-└─────────────────────────────────────────────────────────────────────┘
++--------------------------------------------------------------------+
+|                        Document Input (PDF)                        |
++--------------------------------------------------------------------+
+                                |
+            +-------------------+-------------------+
+            |                                       |
+            v                                       v
++------------------------+             +------------------------+
+|     Digital PDF?       |             |     Scanned PDF?       |
+|   (has text layer)     |             |    (image-based)       |
++------------------------+             +------------------------+
+            |                                       |
+     +------+------+                         +------+------+
+     |             |                         |             |
+     v             v                         v             v
++---------+  +-----------+            +-----------+  +------------+
+|  Text   |  |   Text    |            |   Image   |  |   Image    |
+| Baseline|  |  Advanced |            |  Baseline |  |  Advanced  |
+| PyMuPDF |  | +VLM Struct|           |  RapidOCR |  | +VLM Struct |
++---------+  +-----------+            +-----------+  +------------+
+     |             |                         |             |
+     +------+------+                         +------+------+
+            |                                       |
+            v                                       v
++--------------------------------------------------------------------+
+|                    Semantic Chunking Layer                         |
+|              (LangChain SemanticChunker + BGE-M3)                  |
++--------------------------------------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+|                      Evaluation Layer                              |
+|   +----------+   +-----------+   +----------+   +----------+      |
+|   | Lexical  |   | Structure |   | Chunking |   | Retrieval|      |
+|   | CER, WER |   |    F1     |   |  BC, CS  |   | HR@k,MRR |      |
+|   +----------+   +-----------+   +----------+   +----------+      |
++--------------------------------------------------------------------+
 ```
 
 ---
@@ -155,6 +178,16 @@ pip install -e ".[korean]"
 pip install -e ".[all]"
 ```
 
+### External Services
+
+```bash
+# 1. Embedding API (Infinity with BGE-M3)
+infinity_emb v2 --model-id BAAI/bge-m3 --port 8001
+
+# 2. VLM API (for Advanced parsers)
+# Deploy Qwen3-VL or similar VLM at http://localhost:8005
+```
+
 ### MeCab Installation (Ubuntu)
 
 ```bash
@@ -166,76 +199,48 @@ pip install mecab-python3
 
 ## Usage
 
-### 1. Basic Parser Comparison
+### 1. Parser Comparison (CER/WER/Structure F1)
 
 ```bash
-# Compare all parsers on a document
-python -m src.test_parsers \
-    --pdf data/test_1/test_data_1.pdf \
-    --gt data/test_1/gt_data_1.md \
-    --tokenizer mecab
+# Run all parsers on all test data
+python -m src.eval_parsers --all
 
-# Skip VLM (when GPU unavailable)
-python -m src.test_parsers --pdf document.pdf --gt ground_truth.md --skip-vlm
+# Single file test
+python -m src.eval_parsers --input data/test_1/test.pdf --gt data/test_1/gt.md
+
+# Baseline only (skip VLM-based Advanced parsers)
+python -m src.eval_parsers --all --skip-advanced
+
+# Text parsers only (skip Image/RapidOCR parsers)
+python -m src.eval_parsers --all --skip-image
 ```
+
+**Output**: `results/test_X/` with parsed files, `evaluation.json`, and `README.md` summary.
 
 ### 2. Chunking Quality Evaluation (BC/CS)
 
-Evaluate chunking quality using MoC-based metrics without Ground Truth:
-
 ```bash
-# Basic evaluation with PDF input
-python -m src.test_chunking --input data/test_1/test_data_1.pdf
+# Evaluate all parsed results
+python -m src.eval_chunking --all
 
-# With mock LLM (no API required, for testing)
-python -m src.test_chunking --input data/test.pdf --use-mock
+# With specific breakpoint settings
+python -m src.eval_chunking --all \
+    --breakpoint-type percentile \
+    --breakpoint-threshold 90
 
-# Evaluate pre-parsed files
-python -m src.test_chunking --parsed-files data/test_1/gt_data_1.md --use-mock
+# Mock mode (no embedding API needed)
+python -m src.eval_chunking --all --use-mock
 
-# Full evaluation with complete graph
-python -m src.test_chunking \
-    --input data/test.pdf \
-    --graph-type complete \
-    --threshold-k 0.7 \
-    --output-dir results/chunks/
-
-# Skip VLM parser (OCR only)
-python -m src.test_chunking --input data/test.pdf --skip-vlm --use-mock
+# Evaluate specific directory
+python -m src.eval_chunking --parsed-dir results/test_1/
 ```
 
-**Output**: JSON chunks, evaluation.json, README.md summary in `results/chunks/<timestamp>/`
+**Output**: `chunking.json` in each test folder with BC/CS scores per parser.
 
-### 3. Full Benchmark Pipeline
-
-```bash
-# Run complete evaluation with config
-python -m src.run_benchmark --config experiments/config.yaml
-
-# Run on single document
-python -m src.run_benchmark \
-    --pdf data/test_1/test_data_1.pdf \
-    --gt data/test_1/gt_data_1.md \
-    --qa data/qa_pairs.json \
-    --output results/
-```
-
-### 4. Generate Q&A Dataset
+### 3. Streamlit Dashboard
 
 ```bash
-# Generate Q&A pairs from ground truth documents
-python -m experiments.generate_qa \
-    --config experiments/config.yaml \
-    --output data/qa_pairs.json
-
-# Use specific LLM provider
-python -m experiments.generate_qa --provider openai --questions-per-doc 15
-```
-
-### 5. Streamlit Web UI
-
-```bash
-streamlit run src/app.py --server.port 8501
+streamlit run src/dashboard_analysis.py --server.port 8501
 ```
 
 ---
@@ -248,25 +253,26 @@ streamlit run src/app.py --server.port 8501
 |--------|---------|-------------|
 | **CER** | `(S + D + I) / N` | Character Error Rate |
 | **WER** | `(S + D + I) / N` | Word Error Rate (with morphological tokenization) |
+| **Structure F1** | `2 * P * R / (P + R)` | F1 score for markdown structure elements |
 
-- `S`: Substitutions (incorrect characters/words)
-- `D`: Deletions (missing content)
-- `I`: Insertions (hallucinated content)
-- `N`: Total characters/words in ground truth
-
-### Phase 2: Structural Integrity (MoC-based)
-
-Based on the MoC paper (arXiv:2503.09600v2), we use label-free metrics:
+### Phase 2: Chunking Quality (MoC-based, Semantic Distance)
 
 | Metric | Formula | Description |
 |--------|---------|-------------|
-| **BC (Boundary Clarity)** | `ppl(q\|d) / ppl(q)` | Higher is better - chunks are independent |
-| **CS (Chunk Stickiness)** | Structural Entropy | Lower is better - less inter-chunk dependency |
+| **BC** | `1 - cosine_similarity` | Higher is better (chunks are independent) |
+| **CS** | `-Σ (h_i/2m) * log2(h_i/2m)` | Lower is better (Structural Entropy) |
 
 **Key Advantages**:
 - No Ground Truth required
 - Repeatable measurements in production
-- Strong correlation with RAG performance (BC↔ROUGE-L: 0.88)
+- Strong correlation with RAG performance
+
+**BC Score Interpretation** (Semantic Distance scale):
+| Range | Quality |
+|-------|---------|
+| > 0.5 | Excellent - highly independent chunks |
+| 0.3 - 0.5 | Good - normal semantic chunking |
+| < 0.3 | Needs review - chunks may be too similar |
 
 ### Phase 3: Retrieval Performance
 
@@ -275,15 +281,6 @@ Based on the MoC paper (arXiv:2503.09600v2), we use label-free metrics:
 | **Hit Rate@k** | `hits_in_top_k / total_queries` | Relevant chunk in top-k results |
 | **MRR** | `(1/N) * Σ(1/rank_i)` | Mean Reciprocal Rank |
 
-### Quality Thresholds
-
-| Metric | Excellent | Good | Acceptable |
-|--------|-----------|------|------------|
-| CER | < 2% | < 5% | < 10% |
-| WER | < 5% | < 10% | < 20% |
-| BS | > 0.9 | > 0.8 | > 0.7 |
-| Hit Rate@5 | > 90% | > 75% | > 60% |
-
 ---
 
 ## Project Structure
@@ -291,201 +288,164 @@ Based on the MoC paper (arXiv:2503.09600v2), we use label-free metrics:
 ```
 test-vlm-document-parsing/
 ├── src/
-│   ├── app.py                    # Streamlit Web UI
-│   ├── test_parsers.py           # CLI parser comparison tool (CER/WER)
-│   ├── test_chunking.py          # CLI chunking evaluation (BC/CS)
-│   ├── run_benchmark.py          # Full evaluation pipeline
+│   ├── eval_parsers.py          # CLI: Parser comparison (CER/WER/F1)
+│   ├── eval_chunking.py         # CLI: Chunking evaluation (BC/CS)
+│   ├── dashboard_analysis.py    # Streamlit dashboard
 │   │
-│   ├── parsers/                  # Parser implementations
-│   │   ├── vlm_parser.py         # Qwen3-VL integration
-│   │   ├── ocr_parser.py         # pdfplumber parser
-│   │   └── docling_parser.py     # Docling + RapidOCR
+│   ├── parsers/                 # Parser implementations
+│   │   ├── ocr_parser.py        # Text-Baseline (PyMuPDF), Image-Baseline (RapidOCR)
+│   │   ├── text_structurer.py   # VLM-based text structuring
+│   │   └── two_stage_parser.py  # Advanced parsers (Baseline + VLM)
 │   │
-│   ├── chunking/                 # Text chunking module
-│   │   ├── chunker.py            # Chunking strategies
-│   │   └── metrics.py            # BC/CS metrics (MoC-based)
+│   ├── chunking/                # Semantic chunking module
+│   │   ├── chunker.py           # LangChain SemanticChunker wrapper
+│   │   ├── embeddings.py        # LangChain-compatible API embeddings
+│   │   ├── metrics.py           # BC/CS metrics (Semantic Distance)
+│   │   └── dashboard_export.py  # Dashboard data export utilities
 │   │
-│   ├── retrieval/                # Retrieval evaluation
-│   │   ├── embedder.py           # Text embeddings
-│   │   ├── retriever.py          # Semantic search
-│   │   └── evaluator.py          # HR@k, MRR metrics
+│   ├── dashboard/               # Dashboard components
+│   │   └── styles.py            # CSS styles
 │   │
-│   ├── error_analysis/           # Error analysis module
-│   │   ├── analyzer.py           # Error detection
-│   │   ├── diff_visualizer.py    # HTML diff generation
-│   │   └── case_study.py         # Case study generator
-│   │
-│   └── evaluation/               # Unified evaluation interface
-│       └── __init__.py           # Integration module
-│
-├── experiments/
-│   ├── config.yaml               # Experiment configuration
-│   └── generate_qa.py            # Q&A dataset generator
+│   └── evaluation/              # Unified evaluation interface
+│       └── __init__.py
 │
 ├── data/
-│   ├── test_1/                   # Korean government document
-│   ├── test_2/                   # Receipt image
-│   ├── test_3/                   # English academic paper
-│   └── qa_pairs.json             # Generated Q&A dataset
+│   ├── test_1/                  # Korean government document
+│   ├── test_2/                  # Receipt image
+│   ├── test_3/                  # English academic paper
+│   └── test_4/                  # Additional test document
 │
-├── docs/
-│   └── tech_report/              # Technical report sections
-│       ├── 00_Abstract.md
-│       ├── 01_Introduction.md
-│       ├── 02_Related_Work.md
-│       ├── 03_Methodology.md
-│       ├── 04_Experimental_Setup.md
-│       ├── 05_Results.md
-│       ├── 06_Discussion.md
-│       ├── 07_Conclusion.md
-│       ├── 08_References.md
-│       ├── appendix/
-│       └── figures/
+├── results/                     # Evaluation outputs
+│   ├── test_1/
+│   │   ├── text_baseline_output.txt
+│   │   ├── image_baseline_output.txt
+│   │   ├── text_advanced_output.txt
+│   │   ├── image_advanced_output.txt
+│   │   ├── evaluation.json      # Parsing metrics
+│   │   ├── chunking.json        # Chunking metrics
+│   │   └── README.md            # Summary
+│   └── ...
 │
-├── results/                      # Evaluation outputs
-│   ├── retrieval/
-│   ├── structure/
-│   ├── errors/
-│   └── ablation/
+├── tests/
+│   └── test_chunking_cli.py     # Unit tests for chunking module
 │
-├── _drafts/                      # Legacy evaluation modules
-├── pyproject.toml
-├── README.md
-└── README.ko.md                  # Korean documentation
-```
-
----
-
-## Tech Report
-
-The framework includes a complete academic tech report template:
-
-| Section | Content |
-|---------|---------|
-| **Abstract** | Research summary, key findings |
-| **Introduction** | Problem definition, research questions, contributions |
-| **Related Work** | VLM, OCR, RAG literature review |
-| **Methodology** | Evaluation framework, metric formulas |
-| **Experimental Setup** | Dataset, parser configs, parameters |
-| **Results** | Tables and analysis (template) |
-| **Discussion** | RQ answers, error patterns, limitations |
-| **Conclusion** | Findings, hybrid strategy recommendation |
-| **References** | 26 academic citations |
-| **Appendix** | Prompt variations, full results, case studies |
-
----
-
-## Experimental Results
-
-### Preliminary Results (test_3 - Scanned PDF)
-
-| Parser | CER | WER | Latency |
-|--------|-----|-----|---------|
-| **VLM (Qwen3-VL)** | 56.29% | 70.85% | 15.61s |
-| pdfplumber | 99.62% | 100% | 18.12s |
-| RapidOCR | N/A | N/A | 6.85s |
-
-**Key Finding**: For scanned documents, VLM is the only viable option.
-
-### Hybrid Strategy Recommendation
-
-```
-Document Input
-     │
-     ▼
-  Scanned? ──Yes──► VLM (Required)
-     │
-    No
-     │
-     ▼
-  Complex Layout? ──Yes──► VLM (Recommended)
-  (Tables, Multi-column)
-     │
-    No
-     │
-     ▼
-  pdfplumber (Fast, Sufficient)
-```
-
----
-
-## Prompt Engineering
-
-### Problem: VLM Hallucination
-
-Early prompts caused VLM to add summaries and explanations, increasing insertion errors.
-
-### Solution: Transcription-focused Prompt (v2)
-
-```
-You are a document TRANSCRIPTION engine, not a writer.
-Your job is to CONVERT the given document image into Markdown by
-STRICTLY TRANSCRIBING what is visible in the image.
-
-## Hard Constraints:
-- DO NOT add, rephrase, summarize, infer, or translate any text.
-- DO NOT explain, comment, or describe what you are doing.
-- If something is unreadable, write `[UNREADABLE]` instead of guessing.
-- If a value is missing, use `[EMPTY]`. Never invent values.
-
-## Output:
-(Write ONLY the transcribed Markdown content here.)
+├── pyproject.toml               # Project configuration
+├── README.md                    # English documentation
+└── README.ko.md                 # Korean documentation
 ```
 
 ---
 
 ## Configuration
 
-All experiments are controlled via `experiments/config.yaml`:
+### Chunking Configuration
 
-```yaml
-# Chunking (fixed for fair comparison)
-chunking:
-  strategy: "recursive_character"
-  chunk_size: 500
-  chunk_overlap: 50
+```python
+from src.chunking import ChunkerConfig, create_chunker
 
-# Embedding
-embedding:
-  model: "jhgan/ko-sroberta-multitask"
-  device: "cuda"
+config = ChunkerConfig(
+    breakpoint_threshold_type="percentile",  # percentile, standard_deviation, interquartile, gradient
+    breakpoint_threshold_amount=95.0,        # Threshold value
+    min_chunk_size=None,                     # Optional minimum chunk size
+)
 
-# Retrieval
-retrieval:
-  top_k: [1, 3, 5, 10]
+chunker = create_chunker(
+    config=config,
+    embedding_api_url="http://localhost:8001/embeddings",
+    embedding_model="BAAI/bge-m3",
+)
+```
 
-# Quality thresholds
-thresholds:
-  cer:
-    excellent: 0.02
-    good: 0.05
+### Embedding Client Options
+
+```python
+from src.chunking.metrics import create_embedding_client
+
+# API-based (Infinity with BGE-M3)
+client = create_embedding_client(
+    api_url="http://localhost:8001/embeddings",
+    model="BAAI/bge-m3"
+)
+
+# Local sentence-transformers
+client = create_embedding_client(
+    model="jhgan/ko-sroberta-multitask"
+)
+
+# Mock for testing
+client = create_embedding_client(use_mock=True)
 ```
 
 ---
 
 ## API Reference
 
-### UnifiedEvaluator
+### Parser Classes
 
 ```python
-from src.evaluation import UnifiedEvaluator
-
-evaluator = UnifiedEvaluator(config)
-
-# Full evaluation
-results = evaluator.evaluate_full(
-    parsed_text=parsed_content,
-    ground_truth=gt_content,
-    qa_pairs=qa_data,
-    document_id="test_1",
-    parser_name="vlm"
+from src.parsers import (
+    OCRParser,          # Text-Baseline (PyMuPDF)
+    RapidOCRParser,     # Image-Baseline (RapidOCR)
+    TwoStageParser,     # Advanced parsers (Baseline + VLM)
+    TextStructurer,     # VLM text structuring
 )
 
-# Individual metrics
-lexical = evaluator.evaluate_lexical(parsed, gt)
-structural = evaluator.evaluate_structural(parsed, gt)
-retrieval = evaluator.evaluate_retrieval(parsed, qa_pairs)
-errors = evaluator.analyze_errors(parsed, gt)
+# Two-Stage Parser (Advanced)
+parser = TwoStageParser(
+    structurer_api_url="http://localhost:8005/v1/chat/completions",
+    structurer_model="qwen3-vl-2b-instruct",
+)
+
+# Auto-detect PDF type and parse
+result = parser.parse_auto(pdf_bytes)
+print(f"Content: {result.content}")
+print(f"Stage 1 ({result.stage1_parser}): {result.stage1_time:.2f}s")
+print(f"Stage 2 (VLM): {result.stage2_time:.2f}s")
+```
+
+### Chunking & Evaluation
+
+```python
+from src.chunking import (
+    SemanticChunker,
+    ChunkerConfig,
+    evaluate_chunking,
+    create_embedding_client,
+)
+
+# Chunk text
+config = ChunkerConfig(breakpoint_threshold_type="percentile")
+chunker = SemanticChunker(config, embedding_api_url="http://localhost:8001/embeddings")
+chunks = chunker.chunk(text, document_id="doc1")
+
+# Evaluate chunking quality
+client = create_embedding_client(api_url="http://localhost:8001/embeddings")
+metrics = evaluate_chunking(chunks, embedding_client=client)
+
+print(f"BC: {metrics.bc_score.score:.4f}")
+print(f"CS: {metrics.cs_score.score:.4f}")
+```
+
+---
+
+## Dependencies
+
+Core dependencies:
+
+```toml
+[project]
+dependencies = [
+    "PyMuPDF>=1.24.0",           # Text-Baseline parser
+    "rapidocr-pdf>=0.4.0",       # Image-Baseline parser
+    "rapidocr-onnxruntime>=1.4.0",
+    "langchain-experimental>=0.3.0",  # SemanticChunker
+    "langchain-core>=0.3.0",
+    "httpx>=0.27.0",             # API client
+    "jiwer>=3.0.0",              # CER/WER calculation
+    "numpy>=1.24.0",
+    "streamlit>=1.45.0",         # Dashboard
+    "plotly>=5.18.0",            # Visualization
+]
 ```
 
 ---
@@ -502,12 +462,11 @@ errors = evaluator.analyze_errors(parsed, gt)
 
 ## References
 
-- [jiwer](https://github.com/jitsi/jiwer) - CER/WER calculation
-- [pdfplumber](https://github.com/jsvine/pdfplumber) - PDF text extraction
-- [Docling](https://github.com/DS4SD/docling) - Document understanding
-- [KoNLPy](https://konlpy.org/) - Korean NLP toolkit
-- [Qwen-VL](https://github.com/QwenLM/Qwen-VL) - Vision-Language Model
-- [sentence-transformers](https://www.sbert.net/) - Text embeddings
+- [MoC Paper](https://arxiv.org/abs/2503.09600) - Mixtures of Chunking (BC/CS metrics)
+- [LangChain SemanticChunker](https://python.langchain.com/docs/how_to/semantic-chunker/)
+- [BGE-M3](https://huggingface.co/BAAI/bge-m3) - Multilingual embedding model
+- [PyMuPDF](https://pymupdf.readthedocs.io/) - PDF text extraction
+- [RapidOCR](https://github.com/RapidAI/RapidOCR) - OCR engine
 
 ---
 
