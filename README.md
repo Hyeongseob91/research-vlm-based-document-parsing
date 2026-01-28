@@ -1,3 +1,14 @@
+<div align="center">
+
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](pyproject.toml)
+
+<a href="README.md"><img src="https://img.shields.io/badge/English-blue?style=for-the-badge" alt="English"></a>
+<a href="README.ko.md"><img src="https://img.shields.io/badge/한국어-gray?style=for-the-badge" alt="Korean"></a>
+
+</div>
+
 # Document Parsing Structure Preservation Test Framework
 
 > **"Structure lost at parsing is structure lost forever — no downstream optimization can recover it."**
