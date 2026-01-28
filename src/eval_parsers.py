@@ -2,77 +2,70 @@
 """
 CLI 기반 Parser 테스트 스크립트
 
-다양한 입력 포맷을 지원하는 Parser 비교 테스트:
-1. VLM Parser (Qwen3-VL-2B-Instruct) - 모든 포맷 지원
-2. OCR Parser - Text (pdfplumber) - PDF 전용
-3. OCR Parser - Image (Docling + RapidOCR) - PDF 전용
+4가지 파서 비교 테스트:
+1. Text-Baseline: PyMuPDF 기반 디지털 PDF 텍스트 추출
+2. Image-Baseline: RapidOCR 기반 스캔 PDF OCR
+3. Text-Advanced: Text-Baseline + VLM 구조화
+4. Image-Advanced: Image-Baseline + VLM 구조화
 
 지원 포맷:
-- PDF: 디지털/스캔 PDF (모든 파서 테스트)
-- IMAGE: PNG, JPG, JPEG (VLM만 지원)
-- HWP/HWPX: 한글 문서 (이미지로 변환 후 VLM 파싱)
+- PDF: 디지털/스캔 PDF
 
 Usage:
-    # PDF 테스트
+    # 전체 테스트 (data/ 폴더의 모든 test_* 스캔)
+    python -m src.eval_parsers --all
+
+    # 단일 PDF 테스트
     python -m src.eval_parsers --input data/sample.pdf --gt data/ground_truth.md
 
-    # 이미지 테스트 (VLM만)
-    python -m src.eval_parsers --input data/image.png --gt data/ground_truth.md
-
-    # HWP/HWPX 테스트 (VLM만, LibreOffice 필요)
-    python -m src.eval_parsers --input data/document.hwp --gt data/ground_truth.md
-
-    # 레거시 (--pdf 옵션도 지원)
-    python -m src.eval_parsers --pdf data/sample.pdf
+    # Baseline만 테스트 (Advanced 스킵)
+    python -m src.eval_parsers --all --skip-advanced
 """
 
 import argparse
-import subprocess
 import sys
 import time
 import re
-import tempfile
 from pathlib import Path
 from enum import Enum
-from typing import Optional, List
+from typing import Optional, List, Tuple
+from dataclasses import dataclass
+from collections import defaultdict
+from difflib import SequenceMatcher
 
 import jiwer
 
 # =============================================================================
 # Import Compatibility Layer
 # =============================================================================
-# 두 가지 실행 방식 모두 지원:
-#   1. python -m src.eval_parsers (프로젝트 루트에서)
-#   2. python eval_parsers.py (src/ 디렉토리에서)
 
 def _import_parsers():
     """파서 모듈을 동적으로 임포트 (경로 호환성 처리)"""
-    global VLMParser, OCRParser, ImageOCRParser, DoclingParser, check_docling_available
+    global OCRParser, RapidOCRParser, check_rapidocr_available
+    global TwoStageParser, TwoStageResult
 
     try:
         # 방법 1: src.parsers (프로젝트 루트에서 실행)
-        from src.parsers.vlm_parser import VLMParser
-        from src.parsers.ocr_parser import OCRParser, ImageOCRParser
-        from src.parsers.docling_parser import DoclingParser, check_docling_available
+        from src.parsers.ocr_parser import OCRParser, RapidOCRParser, check_rapidocr_available
+        from src.parsers.two_stage_parser import TwoStageParser, TwoStageResult
     except ImportError:
         try:
-            # 방법 2: parsers (src/ 디렉토리에서 실행 또는 PYTHONPATH 설정)
-            from parsers.vlm_parser import VLMParser
-            from parsers.ocr_parser import OCRParser, ImageOCRParser
-            from parsers.docling_parser import DoclingParser, check_docling_available
+            # 방법 2: parsers (src/ 디렉토리에서 실행)
+            from parsers.ocr_parser import OCRParser, RapidOCRParser, check_rapidocr_available
+            from parsers.two_stage_parser import TwoStageParser, TwoStageResult
         except ImportError as e:
-            print(f"❌ 파서 모듈을 찾을 수 없습니다: {e}")
+            print(f"파서 모듈을 찾을 수 없습니다: {e}")
             print("   프로젝트 루트에서 실행하세요: python -m src.eval_parsers")
             sys.exit(1)
 
-    return VLMParser, OCRParser, ImageOCRParser, DoclingParser, check_docling_available
+    return OCRParser, RapidOCRParser, check_rapidocr_available, TwoStageParser, TwoStageResult
 
 # 지연 임포트를 위한 플레이스홀더
-VLMParser = None
 OCRParser = None
-ImageOCRParser = None
-DoclingParser = None
-check_docling_available = None
+RapidOCRParser = None
+check_rapidocr_available = None
+TwoStageParser = None
+TwoStageResult = None
 
 
 # =============================================================================
@@ -82,9 +75,6 @@ check_docling_available = None
 class FileFormat(Enum):
     """지원하는 파일 포맷"""
     PDF = "pdf"
-    IMAGE = "image"  # PNG, JPG, JPEG
-    HWP = "hwp"      # 한글 97-2003
-    HWPX = "hwpx"    # 한글 2010+
     UNKNOWN = "unknown"
 
 
@@ -94,81 +84,8 @@ def detect_file_format(file_path: Path) -> FileFormat:
 
     if suffix == ".pdf":
         return FileFormat.PDF
-    elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"]:
-        return FileFormat.IMAGE
-    elif suffix == ".hwp":
-        return FileFormat.HWP
-    elif suffix == ".hwpx":
-        return FileFormat.HWPX
     else:
         return FileFormat.UNKNOWN
-
-
-def convert_hwp_to_images(hwp_path: Path, dpi: int = 150) -> List[bytes]:
-    """HWP/HWPX 파일을 이미지로 변환 (LibreOffice 사용)
-
-    Args:
-        hwp_path: HWP/HWPX 파일 경로
-        dpi: 출력 해상도
-
-    Returns:
-        PNG 이미지 바이트 리스트
-
-    Requirements:
-        - LibreOffice 설치 필요 (soffice 명령)
-        - Ubuntu: sudo apt install libreoffice
-    """
-    images = []
-
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-
-            # Step 1: HWP → PDF 변환 (LibreOffice)
-            print("   HWP → PDF 변환 중 (LibreOffice)...", end=" ", flush=True)
-            result = subprocess.run([
-                "soffice",
-                "--headless",
-                "--convert-to", "pdf",
-                "--outdir", str(tmpdir_path),
-                str(hwp_path)
-            ], capture_output=True, timeout=60)
-
-            if result.returncode != 0:
-                print("✗")
-                print(f"   LibreOffice 오류: {result.stderr.decode()}")
-                return []
-
-            print("✓")
-
-            # Step 2: 변환된 PDF 찾기
-            pdf_files = list(tmpdir_path.glob("*.pdf"))
-            if not pdf_files:
-                print("   ❌ PDF 파일 생성 실패")
-                return []
-
-            pdf_path = pdf_files[0]
-            pdf_bytes = pdf_path.read_bytes()
-
-            # Step 3: PDF → 이미지 변환
-            global ImageOCRParser
-            if ImageOCRParser is None:
-                _import_parsers()
-            image_parser = ImageOCRParser()
-            images = image_parser.pdf_to_images(pdf_bytes, dpi=dpi)
-
-            print(f"   PDF → {len(images)} 페이지 이미지 변환 완료")
-
-    except FileNotFoundError:
-        print("\n   ❌ LibreOffice가 설치되지 않았습니다.")
-        print("   Ubuntu: sudo apt install libreoffice")
-        print("   macOS: brew install --cask libreoffice")
-    except subprocess.TimeoutExpired:
-        print("\n   ❌ 변환 타임아웃 (60초 초과)")
-    except Exception as e:
-        print(f"\n   ❌ HWP 변환 오류: {e}")
-
-    return images
 
 
 # =============================================================================
@@ -236,26 +153,26 @@ def get_tokenizer(tokenizer_type: str = "whitespace"):
         try:
             from konlpy.tag import Mecab
             mecab = Mecab()
-            print("✓ Mecab 토크나이저 사용")
+            print("Mecab 토크나이저 사용")
             return mecab.morphs
         except ImportError:
-            print("⚠️ konlpy가 설치되지 않았습니다. whitespace로 fallback")
+            print("konlpy가 설치되지 않았습니다. whitespace로 fallback")
             return lambda x: x.split()
         except Exception as e:
-            print(f"⚠️ Mecab 초기화 실패: {e}. whitespace로 fallback")
+            print(f"Mecab 초기화 실패: {e}. whitespace로 fallback")
             return lambda x: x.split()
 
     elif tokenizer_type == "okt":
         try:
             from konlpy.tag import Okt
             okt = Okt()
-            print("✓ Okt 토크나이저 사용 (순수 Python, 시스템 의존성 없음)")
+            print("Okt 토크나이저 사용")
             return okt.morphs
         except ImportError:
-            print("⚠️ konlpy가 설치되지 않았습니다. whitespace로 fallback")
+            print("konlpy가 설치되지 않았습니다. whitespace로 fallback")
             return lambda x: x.split()
         except Exception as e:
-            print(f"⚠️ Okt 초기화 실패: {e}. whitespace로 fallback")
+            print(f"Okt 초기화 실패: {e}. whitespace로 fallback")
             return lambda x: x.split()
 
     else:
@@ -355,132 +272,243 @@ def calculate_wer(hypothesis: str, reference: str, tokenizer=None) -> dict:
 
 
 # =============================================================================
-# Parser Tests
+# Structure F1 Calculation
 # =============================================================================
 
-def test_vlm_parser(
-    input_data: bytes,
-    verbose: bool = False,
-    file_format: FileFormat = FileFormat.PDF,
-    pre_converted_images: Optional[List[bytes]] = None
-) -> dict:
-    """VLM Parser 테스트 (다양한 입력 포맷 지원)
+@dataclass
+class StructureElement:
+    """구조 요소 데이터 클래스"""
+    type: str          # "heading", "list_item", "table_row", "code_block"
+    level: int         # 헤딩 레벨 (1-6) 또는 리스트 깊이
+    content: str       # 요소 내용 (정규화된 텍스트)
+    line_number: int   # 원본 라인 번호
+
+
+def extract_structure_elements(text: str) -> List[StructureElement]:
+    """마크다운 텍스트에서 구조 요소 추출
 
     Args:
-        input_data: 파일 바이트 데이터
-        verbose: 상세 출력 여부
-        file_format: 파일 포맷
-        pre_converted_images: 미리 변환된 이미지 리스트 (HWP용)
+        text: 마크다운 텍스트
+
+    Returns:
+        구조 요소 리스트
     """
-    global VLMParser, ImageOCRParser
-    if VLMParser is None:
-        _import_parsers()
+    elements = []
+    lines = text.split('\n')
+    in_code_block = False
 
-    print("\n" + "=" * 60)
-    print("🤖 VLM Parser (Qwen3-VL-2B-Instruct)")
-    print("=" * 60)
+    for i, line in enumerate(lines):
+        # Code Block 시작/종료 검출
+        if line.strip().startswith('```'):
+            in_code_block = not in_code_block
+            if not in_code_block:
+                # 코드 블록 종료 시에는 추가하지 않음
+                continue
+            # 코드 블록 시작
+            elements.append(StructureElement(
+                type="code_block",
+                level=0,
+                content=line.strip(),
+                line_number=i
+            ))
+            continue
 
-    start_time = time.time()
+        # 코드 블록 내부는 스킵
+        if in_code_block:
+            continue
 
-    # 입력 포맷에 따른 이미지 준비
-    if pre_converted_images:
-        # HWP/HWPX: 미리 변환된 이미지 사용
-        images = pre_converted_images
-        print(f"📄 입력: 미리 변환된 이미지 ({len(images)} 페이지)")
+        # Heading 검출
+        if match := re.match(r'^(#{1,6})\s+(.+)$', line):
+            elements.append(StructureElement(
+                type="heading",
+                level=len(match.group(1)),
+                content=match.group(2).strip(),
+                line_number=i
+            ))
 
-    elif file_format == FileFormat.IMAGE:
-        # 이미지 파일: 바로 사용
-        images = [input_data]
-        print("📄 입력: 단일 이미지 파일")
+        # Unordered List 검출
+        elif match := re.match(r'^(\s*)[-*+]\s+(.+)$', line):
+            indent = len(match.group(1))
+            elements.append(StructureElement(
+                type="list_item",
+                level=indent // 2,
+                content=match.group(2).strip(),
+                line_number=i
+            ))
 
-    elif file_format == FileFormat.PDF:
-        # PDF → 이미지 변환
-        image_parser = ImageOCRParser()
-        images = image_parser.pdf_to_images(input_data, dpi=150)
+        # Ordered List 검출
+        elif match := re.match(r'^(\s*)\d+\.\s+(.+)$', line):
+            indent = len(match.group(1))
+            elements.append(StructureElement(
+                type="list_item",
+                level=indent // 2,
+                content=match.group(2).strip(),
+                line_number=i
+            ))
 
-        if not images:
-            print("❌ PDF → 이미지 변환 실패")
-            return {"success": False, "error": "이미지 변환 실패"}
+        # Table Row 검출
+        elif re.match(r'^\|.+\|$', line.strip()):
+            # 구분선 제외 (|---|---| 또는 |:---|:---:| 등)
+            if not re.match(r'^\|[\s\-:|]+\|$', line.strip()):
+                elements.append(StructureElement(
+                    type="table_row",
+                    level=0,
+                    content=line.strip(),
+                    line_number=i
+                ))
 
-        print(f"📄 페이지 수: {len(images)}")
+    return elements
 
-    else:
-        print(f"❌ 지원하지 않는 포맷: {file_format}")
-        return {"success": False, "error": f"Unsupported format: {file_format}"}
 
-    # VLM 파싱
-    vlm_parser = VLMParser()
-    results = []
+def match_structure_elements(
+    hypothesis_elements: List[StructureElement],
+    reference_elements: List[StructureElement],
+    similarity_threshold: float = 0.8
+) -> Tuple[int, int, int]:
+    """구조 요소 매칭 및 TP/FP/FN 계산
 
-    for i, img_bytes in enumerate(images):
-        print(f"  처리 중: Page {i+1}/{len(images)}...", end=" ", flush=True)
-        result = vlm_parser.parse(img_bytes)
-        results.append(result)
+    Args:
+        hypothesis_elements: 파서 출력의 구조 요소
+        reference_elements: GT의 구조 요소
+        similarity_threshold: 내용 유사도 임계값
 
-        if result.success:
-            print(f"✓ ({result.elapsed_time:.2f}s)")
-        else:
-            print(f"✗ ({result.error})")
+    Returns:
+        (true_positives, false_positives, false_negatives)
+    """
+    matched_ref = set()
+    matched_hyp = set()
 
-    total_time = time.time() - start_time
+    # 유형별로 그룹화
+    ref_by_type = defaultdict(list)
+    for i, elem in enumerate(reference_elements):
+        ref_by_type[elem.type].append((i, elem))
 
-    # 결과 합치기
-    combined_content = "\n\n".join(
-        r.content for r in results if r.success and r.content
-    )
+    hyp_by_type = defaultdict(list)
+    for i, elem in enumerate(hypothesis_elements):
+        hyp_by_type[elem.type].append((i, elem))
 
-    success_count = sum(1 for r in results if r.success)
+    # 유형별 매칭
+    for elem_type in ref_by_type:
+        if elem_type not in hyp_by_type:
+            continue
 
-    print("\n📊 결과:")
-    print(f"   - 성공: {success_count}/{len(results)} 페이지")
-    print(f"   - 총 시간: {total_time:.2f}s")
-    print(f"   - 평균: {total_time/len(images):.2f}s/page")
-    print(f"   - 추출 길이: {len(combined_content)} chars")
+        ref_items = ref_by_type[elem_type]
+        hyp_items = hyp_by_type[elem_type]
 
-    if verbose and combined_content:
-        print("\n📝 추출 결과 (처음 500자):")
-        print("-" * 40)
-        print(combined_content[:500])
-        print("-" * 40)
+        # 유사도 행렬 계산
+        similarities = []
+        for ri, ref_elem in ref_items:
+            for hi, hyp_elem in hyp_items:
+                sim = SequenceMatcher(
+                    None,
+                    ref_elem.content.lower(),
+                    hyp_elem.content.lower()
+                ).ratio()
+                if sim >= similarity_threshold:
+                    similarities.append((sim, ri, hi))
+
+        # Greedy 매칭 (높은 유사도부터)
+        similarities.sort(reverse=True)
+        for sim, ri, hi in similarities:
+            if ri not in matched_ref and hi not in matched_hyp:
+                matched_ref.add(ri)
+                matched_hyp.add(hi)
+
+    tp = len(matched_ref)
+    fp = len(hypothesis_elements) - len(matched_hyp)
+    fn = len(reference_elements) - len(matched_ref)
+
+    return tp, fp, fn
+
+
+def calculate_structure_f1(hypothesis: str, reference: str, similarity_threshold: float = 0.8) -> dict:
+    """Structure F1 스코어 계산
+
+    Args:
+        hypothesis: 파서 출력 (마크다운)
+        reference: Ground Truth (마크다운)
+        similarity_threshold: 내용 유사도 임계값
+
+    Returns:
+        {
+            "structure_f1": float,
+            "structure_precision": float,
+            "structure_recall": float,
+            "true_positives": int,
+            "false_positives": int,
+            "false_negatives": int,
+            "hypothesis_elements": int,
+            "reference_elements": int
+        }
+    """
+    hyp_elements = extract_structure_elements(hypothesis)
+    ref_elements = extract_structure_elements(reference)
+
+    if not ref_elements:
+        # GT에 구조 요소가 없으면 평가 불가
+        return {
+            "structure_f1": None,
+            "structure_precision": None,
+            "structure_recall": None,
+            "true_positives": 0,
+            "false_positives": len(hyp_elements),
+            "false_negatives": 0,
+            "hypothesis_elements": len(hyp_elements),
+            "reference_elements": 0,
+            "error": "No structure elements in reference"
+        }
+
+    tp, fp, fn = match_structure_elements(hyp_elements, ref_elements, similarity_threshold)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
     return {
-        "success": success_count > 0,
-        "content": combined_content,
-        "elapsed_time": total_time,
-        "page_count": len(images),
-        "per_page_time": total_time / len(images)
+        "structure_f1": f1,
+        "structure_precision": precision,
+        "structure_recall": recall,
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "hypothesis_elements": len(hyp_elements),
+        "reference_elements": len(ref_elements)
     }
 
 
-def test_ocr_text_parser(pdf_bytes: bytes, verbose: bool = False) -> dict:
-    """OCR Parser (Text - pdfplumber) 테스트"""
+# =============================================================================
+# Parser Tests
+# =============================================================================
+
+def test_text_baseline(pdf_bytes: bytes, verbose: bool = False) -> dict:
+    """Text-Baseline Parser (PyMuPDF) 테스트"""
     global OCRParser
     if OCRParser is None:
         _import_parsers()
 
     print("\n" + "=" * 60)
-    print("📖 OCR Parser - Text (pdfplumber)")
+    print("Text-Baseline (PyMuPDF)")
     print("=" * 60)
 
     parser = OCRParser()
 
     # PDF 타입 확인
     pdf_type = parser.detect_pdf_type(pdf_bytes)
-    print(f"📄 PDF 타입: {pdf_type}")
+    print(f"PDF 타입: {pdf_type}")
 
     # 파싱
     result = parser.parse_pdf(pdf_bytes)
 
-    print("\n📊 결과:")
-    print(f"   - 성공: {'✓' if result.success else '✗'}")
+    print("\n결과:")
+    print(f"   - 성공: {'O' if result.success else 'X'}")
     print(f"   - 페이지 수: {result.page_count}")
-    print(f"   - 텍스트 존재: {'✓' if result.has_text else '✗'}")
+    print(f"   - 텍스트 존재: {'O' if result.has_text else 'X'}")
     print(f"   - 표 개수: {len(result.tables)}")
     print(f"   - 총 시간: {result.elapsed_time:.2f}s")
     print(f"   - 추출 길이: {len(result.content)} chars")
 
     if verbose and result.content:
-        print("\n📝 추출 결과 (처음 500자):")
+        print("\n추출 결과 (처음 500자):")
         print("-" * 40)
         print(result.content[:500])
         print("-" * 40)
@@ -495,36 +523,35 @@ def test_ocr_text_parser(pdf_bytes: bytes, verbose: bool = False) -> dict:
     }
 
 
-def test_ocr_image_parser(pdf_bytes: bytes, verbose: bool = False) -> dict:
-    """OCR Parser (Image - Docling) 테스트"""
-    global DoclingParser, check_docling_available
-    if DoclingParser is None:
+def test_image_baseline(pdf_bytes: bytes, verbose: bool = False) -> dict:
+    """Image-Baseline Parser (RapidOCR) 테스트"""
+    global RapidOCRParser, check_rapidocr_available
+    if RapidOCRParser is None:
         _import_parsers()
 
     print("\n" + "=" * 60)
-    print("🔍 OCR Parser - Image (Docling + RapidOCR)")
+    print("Image-Baseline (RapidOCR)")
     print("=" * 60)
 
-    if not check_docling_available():
-        print("❌ Docling 라이브러리가 설치되지 않았습니다.")
-        print("   pip install docling 명령으로 설치하세요.")
-        return {"success": False, "error": "Docling not installed"}
+    if not check_rapidocr_available():
+        print("RapidOCR가 설치되지 않았습니다.")
+        print("   pip install rapidocr-pdf[onnxruntime]")
+        return {"success": False, "error": "RapidOCR not installed"}
 
-    parser = DoclingParser(ocr_enabled=True)
+    parser = RapidOCRParser()
     result = parser.parse_pdf(pdf_bytes)
 
-    print("\n📊 결과:")
-    print(f"   - 성공: {'✓' if result.success else '✗'}")
+    print("\n결과:")
+    print(f"   - 성공: {'O' if result.success else 'X'}")
     print(f"   - 페이지 수: {result.page_count}")
     print(f"   - 총 시간: {result.elapsed_time:.2f}s")
-    print(f"   - 추출 길이 (text): {len(result.content)} chars")
-    print(f"   - 추출 길이 (markdown): {len(result.markdown)} chars")
+    print(f"   - 추출 길이: {len(result.content)} chars")
 
     if result.error:
         print(f"   - 에러: {result.error}")
 
     if verbose and result.content:
-        print("\n📝 추출 결과 (처음 500자):")
+        print("\n추출 결과 (처음 500자):")
         print("-" * 40)
         print(result.content[:500])
         print("-" * 40)
@@ -532,9 +559,103 @@ def test_ocr_image_parser(pdf_bytes: bytes, verbose: bool = False) -> dict:
     return {
         "success": result.success,
         "content": result.content,
-        "markdown": result.markdown,
         "elapsed_time": result.elapsed_time,
         "page_count": result.page_count,
+        "error": result.error
+    }
+
+
+def test_text_advanced(pdf_bytes: bytes, verbose: bool = False) -> dict:
+    """Text-Advanced Parser (PyMuPDF + VLM 구조화) 테스트"""
+    global TwoStageParser
+    if TwoStageParser is None:
+        _import_parsers()
+
+    print("\n" + "=" * 60)
+    print("Text-Advanced (PyMuPDF + VLM)")
+    print("=" * 60)
+
+    parser = TwoStageParser()
+    result = parser.parse_text_pdf(pdf_bytes)
+
+    print("\n결과:")
+    print(f"   - 성공: {'O' if result.success else 'X'}")
+    print(f"   - 페이지 수: {result.page_count}")
+    print(f"   - Stage 1 ({result.stage1_parser}): {result.stage1_time:.2f}s")
+    print(f"   - Stage 2 (VLM 구조화): {result.stage2_time:.2f}s {'O 적용됨' if result.stage2_applied else 'X 미적용'}")
+    print(f"   - 총 시간: {result.elapsed_time:.2f}s")
+    print(f"   - Stage 1 추출 길이: {len(result.stage1_content)} chars")
+    print(f"   - 최종 출력 길이: {len(result.content)} chars")
+
+    if result.error:
+        print(f"   - 에러: {result.error}")
+
+    if verbose and result.content:
+        print("\n구조화 결과 (처음 500자):")
+        print("-" * 40)
+        print(result.content[:500])
+        print("-" * 40)
+
+    return {
+        "success": result.success,
+        "content": result.content,
+        "elapsed_time": result.elapsed_time,
+        "page_count": result.page_count,
+        "stage1_time": result.stage1_time,
+        "stage2_time": result.stage2_time,
+        "stage1_parser": result.stage1_parser,
+        "stage2_applied": result.stage2_applied,
+        "stage1_content_length": len(result.stage1_content),
+        "error": result.error
+    }
+
+
+def test_image_advanced(pdf_bytes: bytes, verbose: bool = False) -> dict:
+    """Image-Advanced Parser (RapidOCR + VLM 구조화) 테스트"""
+    global TwoStageParser, check_rapidocr_available
+    if TwoStageParser is None:
+        _import_parsers()
+
+    print("\n" + "=" * 60)
+    print("Image-Advanced (RapidOCR + VLM)")
+    print("=" * 60)
+
+    if not check_rapidocr_available():
+        print("RapidOCR가 설치되지 않았습니다.")
+        print("   pip install rapidocr-pdf[onnxruntime]")
+        return {"success": False, "error": "RapidOCR not installed"}
+
+    parser = TwoStageParser()
+    result = parser.parse_scanned_pdf(pdf_bytes)
+
+    print("\n결과:")
+    print(f"   - 성공: {'O' if result.success else 'X'}")
+    print(f"   - 페이지 수: {result.page_count}")
+    print(f"   - Stage 1 ({result.stage1_parser}): {result.stage1_time:.2f}s")
+    print(f"   - Stage 2 (VLM 구조화): {result.stage2_time:.2f}s {'O 적용됨' if result.stage2_applied else 'X 미적용'}")
+    print(f"   - 총 시간: {result.elapsed_time:.2f}s")
+    print(f"   - Stage 1 추출 길이: {len(result.stage1_content)} chars")
+    print(f"   - 최종 출력 길이: {len(result.content)} chars")
+
+    if result.error:
+        print(f"   - 에러: {result.error}")
+
+    if verbose and result.content:
+        print("\n구조화 결과 (처음 500자):")
+        print("-" * 40)
+        print(result.content[:500])
+        print("-" * 40)
+
+    return {
+        "success": result.success,
+        "content": result.content,
+        "elapsed_time": result.elapsed_time,
+        "page_count": result.page_count,
+        "stage1_time": result.stage1_time,
+        "stage2_time": result.stage2_time,
+        "stage1_parser": result.stage1_parser,
+        "stage2_applied": result.stage2_applied,
+        "stage1_content_length": len(result.stage1_content),
         "error": result.error
     }
 
@@ -544,7 +665,7 @@ def test_ocr_image_parser(pdf_bytes: bytes, verbose: bool = False) -> dict:
 # =============================================================================
 
 def evaluate_results(results: dict, ground_truth: str, tokenizer=None, tokenizer_name: str = "whitespace") -> dict:
-    """결과 평가 (CER, WER 계산) - jiwer 사용
+    """결과 평가 (CER, WER, Structure F1 계산) - jiwer 사용
 
     Args:
         results: 파서별 결과 딕셔너리
@@ -553,12 +674,14 @@ def evaluate_results(results: dict, ground_truth: str, tokenizer=None, tokenizer
         tokenizer_name: 토크나이저 이름 (출력용)
     """
     print("\n" + "=" * 60)
-    print("📊 평가 결과 (Ground Truth 비교) - jiwer")
+    print("평가 결과 (Ground Truth 비교)")
     print(f"   WER Tokenizer: {tokenizer_name}")
     print("=" * 60)
 
     gt_normalized = normalize_text(ground_truth)
+    gt_structure_elements = extract_structure_elements(ground_truth)
     print(f"Ground Truth 길이: {len(gt_normalized)} chars (정규화 후)")
+    print(f"Ground Truth 구조 요소: {len(gt_structure_elements)} elements")
     print()
 
     evaluation = {}
@@ -566,31 +689,45 @@ def evaluate_results(results: dict, ground_truth: str, tokenizer=None, tokenizer
     for parser_name, result in results.items():
         if not result.get("success"):
             print(f"{parser_name}: SKIP (파싱 실패)")
-            evaluation[parser_name] = {"cer": None, "wer": None}
+            evaluation[parser_name] = {"cer": None, "wer": None, "structure_f1": None}
             continue
 
         content = result.get("content", "")
         if not content:
             print(f"{parser_name}: SKIP (내용 없음)")
-            evaluation[parser_name] = {"cer": None, "wer": None}
+            evaluation[parser_name] = {"cer": None, "wer": None, "structure_f1": None}
             continue
 
-        # 정규화
+        # 정규화 (CER/WER용)
         content_normalized = normalize_text(content)
 
         # CER, WER 계산 (jiwer)
         cer_result = calculate_cer(content_normalized, gt_normalized)
         wer_result = calculate_wer(content_normalized, gt_normalized, tokenizer)
 
+        # Structure F1 계산 (원본 마크다운 사용)
+        structure_f1_result = calculate_structure_f1(content, ground_truth)
+
         cer = cer_result["cer"]
         wer = wer_result["wer"]
+        struct_f1 = structure_f1_result.get("structure_f1")
 
         print(f"{parser_name}:")
         print(f"   - CER: {cer:.4f} ({cer*100:.2f}%)")
-        print(f"      └─ S:{cer_result.get('substitutions', 0)} D:{cer_result.get('deletions', 0)} I:{cer_result.get('insertions', 0)}")
+        print(f"      S:{cer_result.get('substitutions', 0)} D:{cer_result.get('deletions', 0)} I:{cer_result.get('insertions', 0)}")
         print(f"   - WER: {wer:.4f} ({wer*100:.2f}%)")
-        print(f"      └─ S:{wer_result.get('substitutions', 0)} D:{wer_result.get('deletions', 0)} I:{wer_result.get('insertions', 0)}")
-        print(f"      └─ Tokens: ref={wer_result.get('ref_tokens', 0)} hyp={wer_result.get('hyp_tokens', 0)}")
+        print(f"      S:{wer_result.get('substitutions', 0)} D:{wer_result.get('deletions', 0)} I:{wer_result.get('insertions', 0)}")
+        print(f"      Tokens: ref={wer_result.get('ref_tokens', 0)} hyp={wer_result.get('hyp_tokens', 0)}")
+
+        # Structure F1 출력
+        if struct_f1 is not None:
+            print(f"   - Structure F1: {struct_f1:.4f} ({struct_f1*100:.2f}%)")
+            print(f"      P:{structure_f1_result.get('structure_precision', 0):.2f} R:{structure_f1_result.get('structure_recall', 0):.2f}")
+            print(f"      TP:{structure_f1_result.get('true_positives', 0)} FP:{structure_f1_result.get('false_positives', 0)} FN:{structure_f1_result.get('false_negatives', 0)}")
+            print(f"      Elements: hyp={structure_f1_result.get('hypothesis_elements', 0)} ref={structure_f1_result.get('reference_elements', 0)}")
+        else:
+            print(f"   - Structure F1: N/A ({structure_f1_result.get('error', 'unknown error')})")
+
         print(f"   - Latency: {result.get('elapsed_time', 0):.2f}s")
         print()
 
@@ -599,6 +736,8 @@ def evaluate_results(results: dict, ground_truth: str, tokenizer=None, tokenizer
             "cer_detail": cer_result,
             "wer": wer,
             "wer_detail": wer_result,
+            "structure_f1": struct_f1,
+            "structure_f1_detail": structure_f1_result,
             "latency": result.get("elapsed_time", 0),
             "tokenizer": tokenizer_name
         }
@@ -615,9 +754,8 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
         pdf_name: 입력 파일 경로
         evaluation: 평가 결과 (CER, WER)
         tokenizer_name: 토크나이저 이름
-        metadata: 테스트 메타데이터 (title, description, doc_type 등)
+        metadata: 테스트 메타데이터
     """
-    from pathlib import Path
     import json
     from datetime import datetime
 
@@ -625,10 +763,9 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
     output_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _ = Path(pdf_name).stem  # base_name reserved for future use
 
     print("\n" + "=" * 60)
-    print(f"💾 결과 저장: {output_path}")
+    print(f"결과 저장: {output_path}")
     print("=" * 60)
 
     saved_files = []
@@ -642,22 +779,20 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
         if not content:
             continue
 
-        safe_name = parser_name.lower().replace(" ", "-")
-        ext = ".md" if "markdown" in result else ".txt"
-        filename = f"{safe_name}_output{ext}"
+        safe_name = parser_name.lower().replace(" ", "-").replace("-", "_")
+        filename = f"{safe_name}_output.txt"
         filepath = output_path / filename
 
-        save_content = result.get("markdown", content)
-        filepath.write_text(save_content, encoding="utf-8")
+        filepath.write_text(content, encoding="utf-8")
         saved_files.append(filepath)
-        print(f"   ✓ {filename} ({len(save_content)} chars)")
+        print(f"   O {filename} ({len(content)} chars)")
 
     # 2. 평가 결과 JSON 저장
     eval_json = {
         "pdf": pdf_name,
         "timestamp": timestamp,
         "tokenizer": tokenizer_name,
-        "results": {}
+        "parsers": {}
     }
 
     # 메타데이터 추가
@@ -667,23 +802,44 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
             "description": metadata.get("description", ""),
             "doc_type": metadata.get("doc_type", "unknown"),
             "language": metadata.get("language", "unknown"),
-            "tags": metadata.get("tags", [])
         }
 
     for name, result in results.items():
-        eval_json["results"][name] = {
+        eval_json["parsers"][name] = {
             "success": result.get("success"),
             "elapsed_time": result.get("elapsed_time"),
             "content_length": len(result.get("content", ""))
         }
+
+        # Advanced 파서 추가 필드
+        if "stage1_time" in result:
+            eval_json["parsers"][name]["stage1_time"] = result.get("stage1_time")
+            eval_json["parsers"][name]["stage2_time"] = result.get("stage2_time")
+            eval_json["parsers"][name]["stage1_parser"] = result.get("stage1_parser")
+            eval_json["parsers"][name]["stage2_applied"] = result.get("stage2_applied")
+            eval_json["parsers"][name]["stage1_content_length"] = result.get("stage1_content_length")
+
         if evaluation and name in evaluation:
             eval_data = evaluation[name]
-            eval_json["results"][name]["cer"] = eval_data.get("cer")
-            eval_json["results"][name]["wer"] = eval_data.get("wer")
+            eval_json["parsers"][name]["cer"] = eval_data.get("cer")
+            eval_json["parsers"][name]["wer"] = eval_data.get("wer")
+            eval_json["parsers"][name]["structure_f1"] = eval_data.get("structure_f1")
+            # Structure F1 상세 정보
+            if eval_data.get("structure_f1_detail"):
+                sf1_detail = eval_data["structure_f1_detail"]
+                eval_json["parsers"][name]["structure_f1_detail"] = {
+                    "precision": sf1_detail.get("structure_precision"),
+                    "recall": sf1_detail.get("structure_recall"),
+                    "true_positives": sf1_detail.get("true_positives"),
+                    "false_positives": sf1_detail.get("false_positives"),
+                    "false_negatives": sf1_detail.get("false_negatives"),
+                    "hypothesis_elements": sf1_detail.get("hypothesis_elements"),
+                    "reference_elements": sf1_detail.get("reference_elements")
+                }
 
     meta_path = output_path / "evaluation.json"
     meta_path.write_text(json.dumps(eval_json, indent=2, ensure_ascii=False), encoding="utf-8")
-    print("   ✓ evaluation.json")
+    print("   O evaluation.json")
 
     # 3. 요약 마크다운 저장
     summary_lines = [
@@ -700,7 +856,7 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
     ]
 
     for name, result in results.items():
-        success = "✓" if result.get("success") else "✗"
+        success = "O" if result.get("success") else "X"
         latency = f"{result.get('elapsed_time', 0):.2f}s"
         length = f"{len(result.get('content', ''))} chars"
         summary_lines.append(f"| {name} | {success} | {latency} | {length} |")
@@ -710,19 +866,21 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
             "",
             "## Evaluation (vs Ground Truth)",
             "",
-            "| Parser | CER | WER |",
-            "|--------|-----|-----|",
+            "| Parser | CER | WER | Struct-F1 |",
+            "|--------|-----|-----|-----------|",
         ])
         for name, eval_data in evaluation.items():
             cer = eval_data.get("cer")
             wer = eval_data.get("wer")
+            struct_f1 = eval_data.get("structure_f1")
             cer_str = f"{cer*100:.2f}%" if cer is not None else "N/A"
             wer_str = f"{wer*100:.2f}%" if wer is not None else "N/A"
-            summary_lines.append(f"| {name} | {cer_str} | {wer_str} |")
+            struct_f1_str = f"{struct_f1*100:.2f}%" if struct_f1 is not None else "N/A"
+            summary_lines.append(f"| {name} | {cer_str} | {wer_str} | {struct_f1_str} |")
 
     summary_path = output_path / "README.md"
     summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
-    print("   ✓ README.md (요약)")
+    print("   O README.md")
 
     return saved_files
 
@@ -730,31 +888,33 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
 def print_summary(results: dict, evaluation: dict = None):
     """결과 요약 출력"""
     print("\n" + "=" * 60)
-    print("📋 테스트 요약")
+    print("테스트 요약")
     print("=" * 60)
 
     print("\n| Parser | 성공 | 시간 | 추출 길이 |")
     print("|--------|------|------|----------|")
 
     for name, result in results.items():
-        success = "✓" if result.get("success") else "✗"
+        success = "O" if result.get("success") else "X"
         time_str = f"{result.get('elapsed_time', 0):.2f}s"
         length = len(result.get("content", ""))
         print(f"| {name} | {success} | {time_str} | {length} chars |")
 
     if evaluation:
-        print("\n| Parser | CER | WER | Latency |")
-        print("|--------|-----|-----|---------|")
+        print("\n| Parser | CER | WER | Struct-F1 | Latency |")
+        print("|--------|-----|-----|-----------|---------|")
 
         for name, eval_result in evaluation.items():
             cer = eval_result.get("cer")
             wer = eval_result.get("wer")
+            struct_f1 = eval_result.get("structure_f1")
             latency = eval_result.get("latency", 0)
 
             cer_str = f"{cer*100:.2f}%" if cer is not None else "N/A"
             wer_str = f"{wer*100:.2f}%" if wer is not None else "N/A"
+            struct_f1_str = f"{struct_f1*100:.2f}%" if struct_f1 is not None else "N/A"
 
-            print(f"| {name} | {cer_str} | {wer_str} | {latency:.2f}s |")
+            print(f"| {name} | {cer_str} | {wer_str} | {struct_f1_str} | {latency:.2f}s |")
 
 
 # =============================================================================
@@ -762,59 +922,36 @@ def print_summary(results: dict, evaluation: dict = None):
 # =============================================================================
 
 def extract_file_metadata(file_path: Path) -> dict:
-    """파일에서 자동으로 메타데이터 추출
-
-    Args:
-        file_path: 입력 파일 경로
-
-    Returns:
-        메타데이터 딕셔너리
-    """
-    import os
+    """파일에서 자동으로 메타데이터 추출"""
+    import fitz
 
     metadata = {
         "filename": file_path.name,
         "file_size_kb": round(file_path.stat().st_size / 1024, 1),
         "doc_type": "unknown",
         "pages": 0,
-        "title": file_path.stem,  # 확장자 제외한 파일명
+        "title": file_path.stem,
         "language": "unknown",
         "has_text_layer": False,
     }
 
-    # 파일 포맷 감지
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
         metadata["doc_type"] = "PDF"
         try:
-            import pdfplumber
-            with pdfplumber.open(file_path) as pdf:
-                metadata["pages"] = len(pdf.pages)
+            doc = fitz.open(file_path)
+            metadata["pages"] = len(doc)
 
-                # 텍스트 레이어 확인 (첫 페이지)
-                if pdf.pages:
-                    first_page_text = pdf.pages[0].extract_text() or ""
-                    # 의미있는 텍스트가 100자 이상이면 텍스트 레이어 있음
-                    metadata["has_text_layer"] = len(first_page_text.strip()) > 100
+            # 텍스트 레이어 확인 (첫 페이지)
+            if len(doc) > 0:
+                first_page_text = doc[0].get_text("text")
+                metadata["has_text_layer"] = len(first_page_text.strip()) > 100
 
+            doc.close()
         except Exception as e:
-            print(f"⚠️ PDF 메타데이터 추출 실패: {e}")
+            print(f"PDF 메타데이터 추출 실패: {e}")
 
-    elif suffix in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]:
-        metadata["doc_type"] = "Image"
-        metadata["pages"] = 1
-        try:
-            from PIL import Image
-            with Image.open(file_path) as img:
-                metadata["image_size"] = f"{img.width}x{img.height}"
-        except Exception:
-            pass
-
-    elif suffix in [".hwp", ".hwpx"]:
-        metadata["doc_type"] = "HWP"
-        # HWP 메타데이터 추출은 복잡하므로 기본값 사용
-
-    # 언어 감지 (파일명 기반 간단한 휴리스틱)
+    # 언어 감지 (파일명 기반)
     filename = file_path.name
     if any(ord(c) >= 0xAC00 and ord(c) <= 0xD7A3 for c in filename):
         metadata["language"] = "ko"
@@ -823,33 +960,21 @@ def extract_file_metadata(file_path: Path) -> dict:
     elif any(ord(c) >= 0x3040 and ord(c) <= 0x30FF for c in filename):
         metadata["language"] = "ja"
     else:
-        metadata["language"] = "en"  # 기본값
+        metadata["language"] = "en"
 
     return metadata
 
 
 def load_test_metadata(folder_path: Path, input_file: Optional[Path] = None) -> dict:
-    """테스트 폴더의 메타데이터 로드 (파일에서 자동 추출)
-
-    Args:
-        folder_path: data/test_* 폴더 경로
-        input_file: 입력 파일 경로 (있으면 파일에서 메타데이터 추출)
-
-    Returns:
-        메타데이터 딕셔너리
-    """
-    # 입력 파일이 있으면 자동 추출
+    """테스트 폴더의 메타데이터 로드"""
     if input_file and input_file.exists():
         return extract_file_metadata(input_file)
 
     # 폴더에서 입력 파일 찾기
-    input_extensions = [".pdf", ".png", ".jpg", ".jpeg", ".hwp", ".hwpx"]
-    for ext in input_extensions:
-        for f in folder_path.glob(f"*{ext}"):
-            if not f.name.startswith("gt_"):
-                return extract_file_metadata(f)
+    for f in folder_path.glob("*.pdf"):
+        if not f.name.startswith("gt_"):
+            return extract_file_metadata(f)
 
-    # 기본값 반환
     return {
         "filename": "unknown",
         "file_size_kb": 0,
@@ -862,18 +987,13 @@ def load_test_metadata(folder_path: Path, input_file: Optional[Path] = None) -> 
 
 
 def scan_data_folders(data_dir: Path = Path("data")) -> List[dict]:
-    """data/ 폴더의 모든 test_* 폴더를 스캔하여 테스트 정보 반환
-
-    Returns:
-        List of dicts with keys: test_id, input_file, gt_file, folder_path, metadata
-    """
+    """data/ 폴더의 모든 test_* 폴더를 스캔"""
     test_folders = []
 
     if not data_dir.exists():
-        print(f"❌ 데이터 폴더를 찾을 수 없습니다: {data_dir}")
+        print(f"데이터 폴더를 찾을 수 없습니다: {data_dir}")
         return []
 
-    # test_* 패턴의 폴더 찾기
     for folder in sorted(data_dir.iterdir()):
         if not folder.is_dir() or not folder.name.startswith("test_"):
             continue
@@ -882,7 +1002,6 @@ def scan_data_folders(data_dir: Path = Path("data")) -> List[dict]:
         input_file = None
         gt_file = None
 
-        # 입력 파일 찾기 (PDF, 이미지, HWP 등)
         for f in folder.iterdir():
             if f.is_file():
                 fmt = detect_file_format(f)
@@ -892,7 +1011,6 @@ def scan_data_folders(data_dir: Path = Path("data")) -> List[dict]:
                     gt_file = f
 
         if input_file:
-            # 파일에서 메타데이터 자동 추출
             metadata = load_test_metadata(folder, input_file)
 
             test_folders.append({
@@ -903,7 +1021,7 @@ def scan_data_folders(data_dir: Path = Path("data")) -> List[dict]:
                 "metadata": metadata
             })
         else:
-            print(f"⚠️ {test_id}: 입력 파일을 찾을 수 없습니다")
+            print(f"{test_id}: 입력 파일을 찾을 수 없습니다")
 
     return test_folders
 
@@ -912,93 +1030,65 @@ def run_single_test(
     input_path: Path,
     gt_path: Optional[Path] = None,
     output_dir: Optional[Path] = None,
-    skip_vlm: bool = False,
-    skip_docling: bool = False,
+    skip_advanced: bool = False,
+    skip_image: bool = False,
     verbose: bool = False,
     tokenizer_type: str = "whitespace",
-    dpi: int = 150,
     metadata: dict = None
 ) -> dict:
-    """단일 파일 파싱 테스트 실행
-
-    Args:
-        metadata: 테스트 메타데이터 (title, description, doc_type 등)
-
-    Returns:
-        dict with keys: results, evaluation
-    """
+    """단일 파일 파싱 테스트 실행"""
     file_format = detect_file_format(input_path)
     input_bytes = input_path.read_bytes()
 
     print("=" * 60)
-    print("🔬 VLM Document Parsing Quality Test")
+    print("VLM Document Parsing Quality Test")
     print("=" * 60)
-    print(f"📄 입력 파일: {input_path}")
-    print(f"📁 포맷: {file_format.value.upper()}")
-    print(f"📦 크기: {len(input_bytes) / 1024:.1f} KB")
+    print(f"입력 파일: {input_path}")
+    print(f"포맷: {file_format.value.upper()}")
+    print(f"크기: {len(input_bytes) / 1024:.1f} KB")
 
     if file_format == FileFormat.UNKNOWN:
-        print("❌ 지원하지 않는 파일 포맷입니다.")
+        print("지원하지 않는 파일 포맷입니다.")
         return {"results": {}, "evaluation": None}
 
     # Ground Truth 읽기
     ground_truth = None
     if gt_path and gt_path.exists():
         ground_truth = gt_path.read_text(encoding="utf-8")
-        print(f"📋 Ground Truth: {gt_path} ({len(ground_truth)} chars)")
+        print(f"Ground Truth: {gt_path} ({len(ground_truth)} chars)")
 
     results = {}
 
-    # HWP/HWPX 전처리
-    hwp_images = None
-    if file_format in [FileFormat.HWP, FileFormat.HWPX]:
-        print("\n📄 HWP/HWPX 변환 시작...")
-        hwp_images = convert_hwp_to_images(input_path, dpi=dpi)
-        if not hwp_images:
-            print("❌ HWP → 이미지 변환 실패")
-            return {"results": {}, "evaluation": None}
+    # 1. Text-Baseline (PyMuPDF)
+    try:
+        results["Text-Baseline"] = test_text_baseline(input_bytes, verbose)
+    except Exception as e:
+        print(f"Text-Baseline 오류: {e}")
+        results["Text-Baseline"] = {"success": False, "error": str(e)}
 
-    # 포맷별 테스트
-    if file_format == FileFormat.PDF:
-        if not skip_vlm:
-            try:
-                results["VLM"] = test_vlm_parser(input_bytes, verbose, FileFormat.PDF)
-            except Exception as e:
-                print(f"❌ VLM Parser 오류: {e}")
-                results["VLM"] = {"success": False, "error": str(e)}
-
+    # 2. Image-Baseline (RapidOCR)
+    if not skip_image:
         try:
-            results["OCR-Text"] = test_ocr_text_parser(input_bytes, verbose)
+            results["Image-Baseline"] = test_image_baseline(input_bytes, verbose)
         except Exception as e:
-            print(f"❌ OCR-Text Parser 오류: {e}")
-            results["OCR-Text"] = {"success": False, "error": str(e)}
+            print(f"Image-Baseline 오류: {e}")
+            results["Image-Baseline"] = {"success": False, "error": str(e)}
 
-        if not skip_docling:
-            try:
-                results["OCR-Image"] = test_ocr_image_parser(input_bytes, verbose)
-            except Exception as e:
-                print(f"❌ OCR-Image Parser 오류: {e}")
-                results["OCR-Image"] = {"success": False, "error": str(e)}
+    # 3. Text-Advanced (PyMuPDF + VLM)
+    if not skip_advanced:
+        try:
+            results["Text-Advanced"] = test_text_advanced(input_bytes, verbose)
+        except Exception as e:
+            print(f"Text-Advanced 오류: {e}")
+            results["Text-Advanced"] = {"success": False, "error": str(e)}
 
-    elif file_format == FileFormat.IMAGE:
-        print("\n⚠️ 이미지 입력: VLM Parser만 테스트합니다")
-        if not skip_vlm:
-            try:
-                results["VLM"] = test_vlm_parser(input_bytes, verbose, FileFormat.IMAGE)
-            except Exception as e:
-                print(f"❌ VLM Parser 오류: {e}")
-                results["VLM"] = {"success": False, "error": str(e)}
-
-    elif file_format in [FileFormat.HWP, FileFormat.HWPX]:
-        print("\n⚠️ HWP/HWPX 입력: VLM Parser만 테스트합니다")
-        if not skip_vlm:
-            try:
-                results["VLM"] = test_vlm_parser(
-                    input_bytes, verbose, file_format, pre_converted_images=hwp_images
-                )
-            except Exception as e:
-                print(f"❌ VLM Parser 오류: {e}")
-                results["VLM"] = {"success": False, "error": str(e)}
+    # 4. Image-Advanced (RapidOCR + VLM)
+    if not skip_advanced and not skip_image:
+        try:
+            results["Image-Advanced"] = test_image_advanced(input_bytes, verbose)
+        except Exception as e:
+            print(f"Image-Advanced 오류: {e}")
+            results["Image-Advanced"] = {"success": False, "error": str(e)}
 
     # 평가
     evaluation = None
@@ -1018,33 +1108,32 @@ def run_single_test(
 def run_all_tests(
     data_dir: Path = Path("data"),
     results_dir: Path = Path("results"),
-    skip_vlm: bool = False,
-    skip_docling: bool = False,
+    skip_advanced: bool = False,
+    skip_image: bool = False,
     verbose: bool = False,
-    tokenizer_type: str = "whitespace",
-    dpi: int = 150
+    tokenizer_type: str = "whitespace"
 ) -> dict:
-    """data/ 폴더의 모든 테스트 실행
-
-    Returns:
-        dict mapping test_id to test results
-    """
+    """data/ 폴더의 모든 테스트 실행"""
     test_folders = scan_data_folders(data_dir)
 
     if not test_folders:
-        print("❌ 테스트할 데이터가 없습니다.")
+        print("테스트할 데이터가 없습니다.")
         return {}
 
     print("=" * 60)
-    print("🔬 VLM Document Parsing - Batch Test")
+    print("VLM Document Parsing - Batch Test")
     print("=" * 60)
-    print(f"📁 데이터 폴더: {data_dir}")
-    print(f"📊 테스트 수: {len(test_folders)}")
+    print(f"데이터 폴더: {data_dir}")
+    print(f"테스트 수: {len(test_folders)}")
+    if skip_advanced:
+        print("Advanced 파서 스킵됨")
+    if skip_image:
+        print("Image 파서 스킵됨")
     print()
 
     for info in test_folders:
         fmt = detect_file_format(info["input_file"])
-        gt_status = "✓" if info["gt_file"] else "✗"
+        gt_status = "O" if info["gt_file"] else "X"
         print(f"  - {info['test_id']}: {info['input_file'].name} ({fmt.value}) [GT: {gt_status}]")
 
     print()
@@ -1064,11 +1153,10 @@ def run_all_tests(
             input_path=info["input_file"],
             gt_path=info["gt_file"],
             output_dir=output_dir,
-            skip_vlm=skip_vlm,
-            skip_docling=skip_docling,
+            skip_advanced=skip_advanced,
+            skip_image=skip_image,
             verbose=verbose,
             tokenizer_type=tokenizer_type,
-            dpi=dpi,
             metadata=info.get("metadata")
         )
 
@@ -1077,28 +1165,68 @@ def run_all_tests(
     # 전체 요약
     print()
     print("=" * 60)
-    print("📊 전체 테스트 요약")
+    print("전체 테스트 요약")
     print("=" * 60)
 
-    print(f"\n| Test ID | Format | VLM CER | OCR-Text CER | OCR-Image CER |")
-    print(f"|---------|--------|---------|--------------|---------------|")
+    # CER 요약 테이블
+    header_parts = ["Test ID", "Text-Base CER", "Image-Base CER"]
+    if not skip_advanced:
+        header_parts.extend(["Text-Adv CER", "Image-Adv CER"])
+
+    print("\n### CER (Character Error Rate)")
+    print(f"| {' | '.join(header_parts)} |")
+    print(f"|{'-' * 10}|{'-' * 15}|{'-' * 16}|" +
+          (f"{'-' * 14}|{'-' * 15}|" if not skip_advanced else ""))
 
     for test_id, result in all_results.items():
         eval_data = result.get("evaluation", {}) or {}
 
-        vlm_cer = eval_data.get("VLM", {}).get("cer")
-        ocr_text_cer = eval_data.get("OCR-Text", {}).get("cer")
-        ocr_image_cer = eval_data.get("OCR-Image", {}).get("cer")
+        text_base_cer = eval_data.get("Text-Baseline", {}).get("cer")
+        image_base_cer = eval_data.get("Image-Baseline", {}).get("cer")
 
-        vlm_str = f"{vlm_cer*100:.1f}%" if vlm_cer is not None else "N/A"
-        ocr_text_str = f"{ocr_text_cer*100:.1f}%" if ocr_text_cer is not None else "N/A"
-        ocr_image_str = f"{ocr_image_cer*100:.1f}%" if ocr_image_cer is not None else "N/A"
+        text_base_str = f"{text_base_cer*100:.1f}%" if text_base_cer is not None else "N/A"
+        image_base_str = f"{image_base_cer*100:.1f}%" if image_base_cer is not None else "N/A"
 
-        # 포맷 정보
-        test_info = next((t for t in test_folders if t["test_id"] == test_id), None)
-        fmt = detect_file_format(test_info["input_file"]).value if test_info else "?"
+        row = f"| {test_id:<8} | {text_base_str:<13} | {image_base_str:<14} |"
 
-        print(f"| {test_id:<8} | {fmt:<6} | {vlm_str:<7} | {ocr_text_str:<12} | {ocr_image_str:<13} |")
+        if not skip_advanced:
+            text_adv_cer = eval_data.get("Text-Advanced", {}).get("cer")
+            image_adv_cer = eval_data.get("Image-Advanced", {}).get("cer")
+            text_adv_str = f"{text_adv_cer*100:.1f}%" if text_adv_cer is not None else "N/A"
+            image_adv_str = f"{image_adv_cer*100:.1f}%" if image_adv_cer is not None else "N/A"
+            row += f" {text_adv_str:<12} | {image_adv_str:<13} |"
+
+        print(row)
+
+    # Structure F1 요약 테이블
+    struct_header_parts = ["Test ID", "Text-Base F1", "Image-Base F1"]
+    if not skip_advanced:
+        struct_header_parts.extend(["Text-Adv F1", "Image-Adv F1"])
+
+    print("\n### Structure F1")
+    print(f"| {' | '.join(struct_header_parts)} |")
+    print(f"|{'-' * 10}|{'-' * 14}|{'-' * 15}|" +
+          (f"{'-' * 13}|{'-' * 14}|" if not skip_advanced else ""))
+
+    for test_id, result in all_results.items():
+        eval_data = result.get("evaluation", {}) or {}
+
+        text_base_f1 = eval_data.get("Text-Baseline", {}).get("structure_f1")
+        image_base_f1 = eval_data.get("Image-Baseline", {}).get("structure_f1")
+
+        text_base_str = f"{text_base_f1*100:.1f}%" if text_base_f1 is not None else "N/A"
+        image_base_str = f"{image_base_f1*100:.1f}%" if image_base_f1 is not None else "N/A"
+
+        row = f"| {test_id:<8} | {text_base_str:<12} | {image_base_str:<13} |"
+
+        if not skip_advanced:
+            text_adv_f1 = eval_data.get("Text-Advanced", {}).get("structure_f1")
+            image_adv_f1 = eval_data.get("Image-Advanced", {}).get("structure_f1")
+            text_adv_str = f"{text_adv_f1*100:.1f}%" if text_adv_f1 is not None else "N/A"
+            image_adv_str = f"{image_adv_f1*100:.1f}%" if image_adv_f1 is not None else "N/A"
+            row += f" {text_adv_str:<11} | {image_adv_str:<12} |"
+
+        print(row)
 
     return all_results
 
@@ -1109,13 +1237,14 @@ def run_all_tests(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="다중 포맷 Parser 비교 테스트 (VLM, OCR-Text, OCR-Image)",
+        description="4-Parser 비교 테스트 (Text/Image Baseline/Advanced)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-지원 포맷:
-  PDF       : 디지털/스캔 PDF (모든 파서 테스트)
-  IMAGE     : PNG, JPG, JPEG, WebP, GIF, BMP, TIFF (VLM만)
-  HWP/HWPX  : 한글 문서 (LibreOffice로 변환 후 VLM)
+파서 구조:
+  Text-Baseline  : PyMuPDF (디지털 PDF 텍스트 추출)
+  Image-Baseline : RapidOCR (스캔 PDF OCR)
+  Text-Advanced  : PyMuPDF + VLM 구조화
+  Image-Advanced : RapidOCR + VLM 구조화
 
 예시:
   # 전체 테스트 (data/ 폴더의 모든 test_* 스캔)
@@ -1124,8 +1253,8 @@ def main():
   # 단일 파일 테스트
   python -m src.eval_parsers --input data/test_1/test.pdf --gt data/test_1/gt.md
 
-  # 특정 데이터 폴더 지정
-  python -m src.eval_parsers --all --data-dir ./my_data
+  # Baseline만 테스트
+  python -m src.eval_parsers --all --skip-advanced
         """
     )
 
@@ -1138,11 +1267,11 @@ def main():
     )
     input_group.add_argument(
         "--input", "-i",
-        help="테스트할 입력 파일 (PDF, 이미지, HWP/HWPX)"
+        help="테스트할 입력 파일 (PDF)"
     )
     input_group.add_argument(
         "--pdf", "-p",
-        help="테스트할 PDF 파일 경로 (레거시 옵션, --input 사용 권장)"
+        help="테스트할 PDF 파일 경로 (레거시 옵션)"
     )
 
     parser.add_argument(
@@ -1167,14 +1296,14 @@ def main():
         help="상세 출력 (추출 결과 미리보기)"
     )
     parser.add_argument(
-        "--skip-vlm",
+        "--skip-advanced",
         action="store_true",
-        help="VLM Parser 테스트 스킵"
+        help="Advanced 파서 테스트 스킵 (Baseline만 테스트)"
     )
     parser.add_argument(
-        "--skip-docling",
+        "--skip-image",
         action="store_true",
-        help="Docling Parser 테스트 스킵"
+        help="Image 파서 테스트 스킵 (Text 파서만 테스트)"
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -1186,12 +1315,6 @@ def main():
         default="whitespace",
         help="WER 계산용 토크나이저 (기본: whitespace)"
     )
-    parser.add_argument(
-        "--dpi",
-        type=int,
-        default=150,
-        help="PDF/HWP → 이미지 변환 해상도 (기본: 150)"
-    )
 
     args = parser.parse_args()
 
@@ -1200,18 +1323,17 @@ def main():
         run_all_tests(
             data_dir=args.data_dir,
             results_dir=args.results_dir,
-            skip_vlm=args.skip_vlm,
-            skip_docling=args.skip_docling,
+            skip_advanced=args.skip_advanced,
+            skip_image=args.skip_image,
             verbose=args.verbose,
-            tokenizer_type=args.tokenizer,
-            dpi=args.dpi
+            tokenizer_type=args.tokenizer
         )
         return
 
     # 단일 파일 모드
     input_path = Path(args.input if args.input else args.pdf)
     if not input_path.exists():
-        print(f"❌ 파일을 찾을 수 없습니다: {input_path}")
+        print(f"파일을 찾을 수 없습니다: {input_path}")
         sys.exit(1)
 
     gt_path = Path(args.gt) if args.gt else None
@@ -1221,11 +1343,10 @@ def main():
         input_path=input_path,
         gt_path=gt_path,
         output_dir=output_dir,
-        skip_vlm=args.skip_vlm,
-        skip_docling=args.skip_docling,
+        skip_advanced=args.skip_advanced,
+        skip_image=args.skip_image,
         verbose=args.verbose,
-        tokenizer_type=args.tokenizer,
-        dpi=args.dpi
+        tokenizer_type=args.tokenizer
     )
 
 
