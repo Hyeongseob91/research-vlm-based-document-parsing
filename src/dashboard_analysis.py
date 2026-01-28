@@ -696,351 +696,435 @@ with tab_parsing:
 # TAB 2: Chunking Test
 # =============================================================================
 
-with tab_chunking:
-    st.markdown("## Semantic Chunking 품질 분석")
-    st.markdown("> **연구 가설**: 구조화된 파싱 결과가 유사도 기반 청킹 품질에 긍정적 영향을 미친다")
-
-    # =========================================================================
-    # 데이터 상태 확인 및 요약 대시보드
-    # =========================================================================
-
-    # 청킹 결과가 있는 테스트 확인
-    tests_with_chunking = get_tests_with_chunking(raw_data)
-    chunking_parsers = get_chunking_parsers(raw_data)
-
-    # 데이터 상태 판단
-    def get_chunking_status(test_data: dict) -> dict:
-        """청킹 데이터 상태 분석"""
+def get_chunking_data_dict(raw_data: Dict) -> Dict:
+    """Chunking 데이터를 Parsing과 동일한 형식으로 변환"""
+    chunking_dict = {}
+    for test_id, test_data in raw_data.get("tests", {}).items():
         chunking = test_data.get("chunking", {})
-        config = chunking.get("config", {})
-        results = chunking.get("results", {})
+        if not chunking or not chunking.get("results"):
+            continue
 
-        status = {
-            "has_chunks": bool(results),
-            "has_bc": False,
-            "has_cs": False,
-            "is_mock": config.get("use_mock", False),
-            "strategy": config.get("strategy", "unknown"),
-            "llm_model": config.get("llm_model", "N/A"),
-            "chunk_counts": {},
-        }
+        # Parsing과 동일한 형식으로 변환
+        parsers_data = {}
+        for parser, result in chunking.get("results", {}).items():
+            bc = result.get("bc", {})
+            cs = result.get("cs", {})
+            parsers_data[parser] = {
+                "bc": bc.get("score"),
+                "bc_min": bc.get("min"),
+                "bc_max": bc.get("max"),
+                "bc_std": bc.get("std"),
+                "cs": cs.get("score"),
+                "chunk_count": result.get("chunk_count", 0),
+            }
 
-        for parser, result in results.items():
-            status["chunk_counts"][parser] = result.get("chunk_count", 0)
-            if result.get("bc", {}).get("score") is not None:
-                status["has_bc"] = True
-            if result.get("cs", {}).get("score") is not None:
-                status["has_cs"] = True
+        if parsers_data:
+            chunking_dict[test_id] = {
+                "id": test_id,
+                "parsers": parsers_data,
+                "config": chunking.get("config", {}),
+                "metadata": test_data.get("evaluation", {}).get("metadata", {}),
+            }
 
-        return status
+    return chunking_dict
 
-    # 전체 상태 집계
-    all_statuses = {}
-    for test_id in tests_with_chunking:
-        test_data = raw_data.get("tests", {}).get(test_id, {})
-        all_statuses[test_id] = get_chunking_status(test_data)
 
-    # =========================================================================
-    # 상태 표시 배너
-    # =========================================================================
-    if not tests_with_chunking:
-        st.warning("청킹 테스트 데이터가 없습니다.")
+def create_chunking_metrics_subplot(chunking_data: Dict) -> go.Figure:
+    """BC/CS 메트릭을 하나의 Subplot으로 통합한 차트 (Parsing과 동일한 형식)"""
+    test_ids = [d["id"] for d in chunking_data.values()]
 
-        st.markdown("### 실험 실행 가이드")
-        st.markdown("""
-        ```bash
-        # 1. 먼저 파싱 테스트 실행
-        uv run python src/test_parsers.py --test-id test_5
+    # 메트릭 정의: (key, title, lower_is_better, format_func)
+    metrics = [
+        ("bc", "BC (Boundary Clarity) ↑", False, lambda v: f"{v:.3f}"),
+        ("cs", "CS (Chunk Stickiness) ↓", True, lambda v: f"{v:.3f}"),
+        ("chunk_count", "Chunk Count", False, lambda v: f"{int(v)}"),
+        ("bc_std", "BC Std (Consistency) ↓", True, lambda v: f"{v:.3f}"),
+    ]
 
-        # 2. 청킹 테스트 실행 (Mock - 빠른 테스트)
-        uv run python src/eval_chunking.py --test-id test_5 --use-mock
+    # 파서 목록 수집
+    all_parsers = set()
+    for test in chunking_data.values():
+        all_parsers.update(test["parsers"].keys())
+    parser_list = sorted(list(all_parsers))
 
-        # 3. 청킹 테스트 실행 (Real BC - OpenAI API 사용)
-        uv run python src/eval_chunking.py --test-id test_5 --skip-cs
-        ```
-        """)
+    # 2x2 서브플롯 생성
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[m[1] for m in metrics],
+        horizontal_spacing=0.10,
+        vertical_spacing=0.18,
+    )
+
+    # 각 메트릭별로 바 추가
+    for idx, (metric_key, title, lower_is_better, fmt) in enumerate(metrics):
+        row = idx // 2 + 1
+        col = idx % 2 + 1
+
+        for parser_idx, parser in enumerate(parser_list):
+            color = PARSER_COLORS.get(parser, DEFAULT_COLORS[parser_idx % len(DEFAULT_COLORS)])
+            values = [
+                test["parsers"].get(parser, {}).get(metric_key) or 0
+                for test in chunking_data.values()
+            ]
+
+            # 첫 번째 서브플롯에서만 legend 표시
+            show_legend = (idx == 0)
+
+            fig.add_trace(
+                go.Bar(
+                    name=parser,
+                    x=test_ids,
+                    y=values,
+                    marker_color=color,
+                    marker_line_width=0,
+                    text=[fmt(v) if v else "N/A" for v in values],
+                    textposition="outside",
+                    textfont=dict(size=10),
+                    showlegend=show_legend,
+                    legendgroup=parser,
+                ),
+                row=row, col=col
+            )
+
+    # 레이아웃 설정
+    fig.update_layout(
+        height=650,
+        barmode="group",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(size=11, color="#666"),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.04,
+            xanchor="left",
+            x=0,
+            font=dict(size=14),
+        ),
+        margin=dict(l=50, r=30, t=100, b=40),
+        bargap=0.15,
+        bargroupgap=0.05,
+    )
+
+    # 각 축 설정
+    for i in range(1, 5):
+        fig.update_xaxes(showgrid=False, tickfont=dict(size=10), row=(i-1)//2+1, col=(i-1)%2+1)
+        fig.update_yaxes(gridcolor="#E5E5E5", gridwidth=0.5, zeroline=False, tickfont=dict(size=10), row=(i-1)//2+1, col=(i-1)%2+1)
+
+    # 서브플롯 타이틀 스타일
+    for annotation in fig['layout']['annotations']:
+        annotation['font'] = dict(size=15, color="#1a1a2e", weight="bold")
+        annotation['xanchor'] = 'left'
+        if annotation['x'] < 0.5:
+            annotation['x'] = 0.0
+        else:
+            annotation['x'] = 0.55
+
+    return fig
+
+
+def create_chunking_thin_bar_chart(data: Dict, metric: str, title: str,
+                                    lower_is_better: bool = False) -> go.Figure:
+    """Chunking용 얇은 가로형 Bar Chart"""
+    parsers = list(data["parsers"].keys())
+    values = [data["parsers"][p].get(metric) or 0 for p in parsers]
+    colors = [PARSER_COLORS.get(p, "#888") for p in parsers]
+
+    fig = go.Figure()
+
+    # Format based on metric type
+    if metric == "chunk_count":
+        text_values = [f"{int(v)}" for v in values]
     else:
-        # 상태 요약
-        has_any_bc = any(s["has_bc"] for s in all_statuses.values())
-        has_any_cs = any(s["has_cs"] for s in all_statuses.values())
-        any_mock = any(s["is_mock"] for s in all_statuses.values())
+        text_values = [f"{v:.4f}" for v in values]
 
-        # 상태 배지
-        col_status1, col_status2, col_status3, col_status4 = st.columns(4)
+    fig.add_trace(go.Bar(
+        y=parsers,
+        x=values,
+        orientation='h',
+        marker_color=colors,
+        marker_line_width=0,
+        text=text_values,
+        textposition="outside",
+        textfont=dict(size=12, color="#333"),
+    ))
 
-        with col_status1:
-            st.metric(
-                "테스트 수",
-                len(tests_with_chunking),
-                help="청킹 결과가 있는 테스트 수"
-            )
+    direction = "← Lower is better" if lower_is_better else "Higher is better →"
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14, color="#1a1a2e"), x=0),
+        height=180,
+        margin=dict(l=10, r=80, t=40, b=25),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(size=12, color="#666"),
+        xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+        yaxis=dict(showgrid=False, tickfont=dict(size=12)),
+        showlegend=False,
+        annotations=[dict(
+            text=direction, x=1, y=-0.12, xref="paper", yref="paper",
+            showarrow=False, font=dict(size=10, color="#888"), xanchor="right"
+        )]
+    )
+    return fig
 
-        with col_status2:
-            if has_any_bc:
-                if any_mock:
-                    st.metric("BC 데이터", "Mock", delta="⚠️ 추정치", delta_color="off")
-                else:
-                    st.metric("BC 데이터", "Real", delta="✓ LLM 기반", delta_color="off")
-            else:
-                st.metric("BC 데이터", "없음", delta="청크만 생성됨", delta_color="off")
 
-        with col_status3:
-            if has_any_cs:
-                st.metric("CS 데이터", "있음", delta="✓ 계산됨", delta_color="off")
-            else:
-                st.metric("CS 데이터", "없음", delta="--skip-cs 사용됨", delta_color="off")
+with tab_chunking:
+    st.markdown("## Chunking Test Results")
 
-        with col_status4:
-            total_chunks = sum(
-                sum(s["chunk_counts"].values())
-                for s in all_statuses.values()
-            )
-            st.metric("총 청크 수", f"{total_chunks:,}")
-
-        # Mock 데이터 경고
-        if any_mock and has_any_bc:
-            st.info(
-                "**Mock 데이터 사용 중**: BC/CS 값은 단어 통계 기반 휴리스틱 추정치입니다. "
-                "정확한 분석을 위해 `--skip-mock` 옵션으로 OpenAI API를 사용하세요."
-            )
-
-        st.markdown("---")
-
-        # =========================================================================
-        # 테스트별 청킹 요약
-        # =========================================================================
-        st.markdown("### 테스트별 청킹 결과 요약")
-
-        for test_id in tests_with_chunking:
-            status = all_statuses[test_id]
-
-            # 상태 아이콘
-            if status["has_bc"] and not status["is_mock"]:
-                status_icon = "✅"
-                status_text = "Real BC"
-            elif status["has_bc"] and status["is_mock"]:
-                status_icon = "⚠️"
-                status_text = "Mock BC"
-            else:
-                status_icon = "📦"
-                status_text = "Chunks Only"
-
-            with st.expander(
-                f"{status_icon} **{test_id}** | {status_text} | Strategy: {status['strategy']} | "
-                f"Chunks: {sum(status['chunk_counts'].values())}"
-            ):
-                # 청크 수 비교 테이블
-                chunk_df_data = []
-                for parser, count in status["chunk_counts"].items():
-                    chunk_df_data.append({
-                        "Parser": parser,
-                        "Chunk Count": count,
-                        "Strategy": status["strategy"],
-                        "LLM Model": status["llm_model"],
-                    })
-
-                if chunk_df_data:
-                    chunk_df = pd.DataFrame(chunk_df_data)
-                    st.dataframe(chunk_df, use_container_width=True, hide_index=True)
-
-                # BC/CS 데이터가 있으면 표시
-                if status["has_bc"]:
-                    test_data = raw_data.get("tests", {}).get(test_id, {})
-                    chunking_results = test_data.get("chunking", {}).get("results", {})
-
-                    bc_cs_data = []
-                    for parser, result in chunking_results.items():
-                        bc = result.get("bc", {})
-                        cs = result.get("cs", {})
-                        bc_cs_data.append({
-                            "Parser": parser,
-                            "BC (↑)": f"{bc.get('score', 0):.4f}" if bc.get('score') is not None else "N/A",
-                            "BC Std": f"±{bc.get('std', 0):.4f}" if bc.get('std') is not None else "-",
-                            "CS (↓)": f"{cs.get('score', 0):.4f}" if cs.get('score') is not None else "N/A",
-                            "CS Std": f"±{cs.get('std', 0):.4f}" if cs.get('std') is not None else "-",
-                        })
-
-                    if bc_cs_data:
-                        st.markdown("**BC / CS Metrics**")
-                        bc_cs_df = pd.DataFrame(bc_cs_data)
-                        st.dataframe(bc_cs_df, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-
-        # =========================================================================
-        # Parser 비교 차트 (BC/CS 데이터가 있을 때만)
-        # =========================================================================
-        if has_any_bc:
-            st.markdown("### Parser별 BC/CS 비교")
-
-            # 비교 가능한 전략 수집
-            all_strategies = set()
-            for parser in chunking_parsers:
-                strategies = get_chunking_data_for_parser(raw_data, parser)
-                for s in strategies:
-                    all_strategies.add(s.get("strategy", "unknown"))
-
-            strategy_list = sorted(list(all_strategies))
-
-            if strategy_list:
-                selected_strategy = st.selectbox(
-                    "비교할 전략",
-                    options=strategy_list,
-                    index=strategy_list.index("semantic") if "semantic" in strategy_list else 0,
-                    key="chunking_strategy_select"
-                )
-
-                # 비교 차트
-                comparison_fig = create_parser_chunking_comparison(
-                    CHUNKING_DATA,
-                    selected_strategy,
-                    title=f"Parser별 Chunking 품질 비교"
-                )
-                st.plotly_chart(
-                    comparison_fig,
-                    use_container_width=True,
-                    config=get_chart_download_config(f"parser_comparison_{selected_strategy}")
-                )
-
-            st.markdown("---")
-
-        # =========================================================================
-        # Parser별 상세 분석
-        # =========================================================================
-        if chunking_parsers and chunking_parsers != ["_legacy"]:
-            st.markdown("### Parser별 상세 분석")
-
-            selected_parser = st.selectbox(
-                "분석할 Parser 선택",
-                options=chunking_parsers,
-                key="chunking_parser_select"
-            )
-
-            parser_strategies = get_chunking_data_for_parser(raw_data, selected_parser)
-
-            if parser_strategies:
-                # BC/CS 차트 (2열)
-                chart_col1, chart_col2 = st.columns(2)
-
-                with chart_col1:
-                    st.markdown("##### Boundary Clarity Flow")
-                    st.caption("문장별 BC 값 (높을수록 경계 품질 우수)")
-
-                    bc_flow_fig = create_bc_document_flow(
-                        parser_strategies,
-                        title=f"{selected_parser}: BC by Sentence"
-                    )
-                    st.plotly_chart(
-                        bc_flow_fig,
-                        use_container_width=True,
-                        config=get_chart_download_config(f"bc_flow_{selected_parser}")
-                    )
-
-                with chart_col2:
-                    st.markdown("##### Chunk Stickiness")
-                    st.caption("청크 내부 유사도 (낮을수록 독립적)")
-
-                    cs_bar_fig = create_cs_mean_std_bar(
-                        parser_strategies,
-                        title=f"{selected_parser}: Intra-chunk Similarity"
-                    )
-                    st.plotly_chart(
-                        cs_bar_fig,
-                        use_container_width=True,
-                        config=get_chart_download_config(f"cs_bar_{selected_parser}")
-                    )
-            else:
-                st.info(f"{selected_parser}의 BC/CS 데이터가 없습니다.")
+    # Metrics 정의
+    with st.expander("📐 Metrics 정의", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**BC (Boundary Clarity)** · :orange[↑ 높을수록 좋음]")
+            st.markdown("인접 청크 간 의미적 독립성. `1 - cosine_similarity`")
+            st.markdown("**CS (Chunk Stickiness)** · :green[↓ 낮을수록 좋음]")
+            st.markdown("청크 그래프의 구조적 엔트로피. 청크 간 연결성.")
+        with col2:
+            st.markdown("**Chunk Count** · 문서당 청크 수")
+            st.markdown("SemanticChunker 기반 자동 분할 결과.")
+            st.markdown("**BC Std** · :green[↓ 낮을수록 좋음]")
+            st.markdown("BC 표준편차. 일관된 경계 품질 측정.")
 
     st.markdown("---")
 
-    # =========================================================================
-    # BC / CS 개념 설명 (접기)
-    # =========================================================================
-    with st.expander("📐 BC / CS Metrics 이해하기", expanded=False):
-        col_bc, col_cs = st.columns(2)
+    # 청킹 데이터 로드
+    CHUNKING_DATA_DICT = get_chunking_data_dict(raw_data)
+    tests_with_chunking = get_tests_with_chunking(raw_data)
 
-        with col_bc:
-            st.markdown("""
-            ### Boundary Clarity (BC)
-            **인접 청크 간 의미적 독립성** · :green[↑ 높을수록 좋음]
+    if not tests_with_chunking:
+        st.warning("청킹 테스트 데이터가 없습니다.")
+        st.markdown("""
+        **실행 방법:**
+        ```bash
+        python -m src.eval_chunking --parsed-dir results/test_1/ --verbose
+        ```
+        """)
+    else:
+        # =====================================================================
+        # Global Performance Summary
+        # =====================================================================
+        st.markdown("### 📈 Global Performance Summary")
 
-            ```
-            BC = 1 - cosine_similarity(chunk_i, chunk_i+1)
+        col_table, col_chart = st.columns([2, 3])
 
-            인접 청크 간 임베딩 거리 (Semantic Distance)
-            ```
+        with col_table:
+            # Summary DataFrame 생성
+            summary_df = get_chunking_summary_df(raw_data)
+            if not summary_df.empty:
+                display_df = summary_df.copy()
+                # 컬럼 포맷팅
+                display_df["BC Score"] = display_df["BC Score"].apply(
+                    lambda x: f"{x:.4f}" if pd.notna(x) else "N/A"
+                )
+                display_df["CS Score"] = display_df["CS Score"].apply(
+                    lambda x: f"{x:.4f}" if pd.notna(x) else "N/A"
+                )
+                display_df = display_df.rename(columns={
+                    "Test ID": "Test",
+                    "BC Score": "BC ↑",
+                    "CS Score": "CS ↓",
+                    "Chunk Count": "Chunks",
+                })
+                # 필요한 컬럼만 표시
+                display_cols = ["Test", "Parser", "BC ↑", "CS ↓", "Chunks"]
+                display_df = display_df[[c for c in display_cols if c in display_df.columns]]
 
-            - **BC > 0.5**: 우수한 경계 품질
-            - **BC ≈ 1.0**: 이상적 (청크가 의미적으로 독립)
-            - **BC < 0.3**: 청크 경계 재검토 필요
-            """)
+                st.dataframe(display_df, use_container_width=True, hide_index=True, height=350)
 
-        with col_cs:
-            st.markdown("""
-            ### Chunk Stickiness (CS)
-            **청크 그래프의 구조적 엔트로피** · :orange[↓ 낮을수록 좋음]
+                # CSV 다운로드
+                csv_data = export_df_to_csv(summary_df)
+                st.download_button(
+                    label="📥 CSV 다운로드",
+                    data=csv_data,
+                    file_name="chunking_summary.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("표시할 데이터가 없습니다.")
 
-            ```
-            CS = -Σ (h_i / 2m) × log₂(h_i / 2m)
+        with col_chart:
+            # Bubble Chart - BC vs CS, size = Chunk Count
+            if CHUNKING_DATA_DICT:
+                # 데이터 수집
+                plot_data = []
+                for test_id, test_data in CHUNKING_DATA_DICT.items():
+                    for parser, metrics in test_data["parsers"].items():
+                        if metrics.get("bc") is not None and metrics.get("cs") is not None:
+                            plot_data.append({
+                                "parser": parser,
+                                "test_id": test_id,
+                                "bc": metrics.get("bc", 0),
+                                "cs": metrics.get("cs", 0),
+                                "chunks": metrics.get("chunk_count", 1),
+                            })
 
-            h_i: 노드 i의 가중 차수
-            m: 전체 엣지 가중치 합 / 2
-            ```
+                if plot_data:
+                    # 파서별 색상 매핑
+                    unique_parsers = sorted(list(set(d["parser"] for d in plot_data)))
+                    colors = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf", "#999999"]
 
-            - **CS < 1.0**: 청크가 독립적 (좋음)
-            - **CS > 2.0**: 과도한 연결성 (분할 필요)
-            - 임베딩 코사인 유사도 기반 그래프 구축
-            """)
+                    fig = go.Figure()
+
+                    for i, parser in enumerate(unique_parsers):
+                        parser_data = [d for d in plot_data if d["parser"] == parser]
+                        # 버블 크기 정규화 (min 15, max 50)
+                        chunks = [d["chunks"] for d in parser_data]
+                        max_chunks = max(d["chunks"] for d in plot_data)
+                        min_chunks = min(d["chunks"] for d in plot_data)
+                        if max_chunks > min_chunks:
+                            sizes = [15 + (c - min_chunks) / (max_chunks - min_chunks) * 35 for c in chunks]
+                        else:
+                            sizes = [25] * len(chunks)
+
+                        fig.add_trace(go.Scatter(
+                            x=[d["bc"] for d in parser_data],
+                            y=[d["cs"] for d in parser_data],
+                            mode="markers",
+                            name=parser,
+                            marker=dict(
+                                size=sizes,
+                                color=colors[i % len(colors)],
+                                opacity=0.7,
+                                line=dict(width=2, color="white"),
+                            ),
+                            text=[f"{d['test_id']}<br>Chunks: {d['chunks']}" for d in parser_data],
+                            hovertemplate="<b>%{text}</b><br>BC: %{x:.3f}<br>CS: %{y:.2f}<extra></extra>",
+                        ))
+
+                    fig.update_layout(
+                        title=dict(text="BC vs CS (size=Chunks)", font=dict(size=14, color="#1a1a2e"), x=0),
+                        xaxis=dict(title="BC (Boundary Clarity) ↑", gridcolor="#eee"),
+                        yaxis=dict(title="CS (Chunk Stickiness) ↓", gridcolor="#eee"),
+                        height=350,
+                        margin=dict(l=60, r=20, t=50, b=50),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(size=11, color="#666"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                        showlegend=True,
+                    )
+
+                    st.plotly_chart(fig, use_container_width=True, config=get_chart_download_config("chunking_bubble"))
+                else:
+                    st.info("차트 데이터가 없습니다.")
+            else:
+                st.info("차트 데이터가 없습니다.")
+
+        # =====================================================================
+        # Metrics Comparison - 통합 Subplot 차트
+        # =====================================================================
+        if CHUNKING_DATA_DICT:
+            st.markdown("#### Metrics Comparison")
+
+            metrics_fig = create_chunking_metrics_subplot(CHUNKING_DATA_DICT)
+            st.plotly_chart(
+                metrics_fig,
+                use_container_width=True,
+                config=get_chart_download_config("chunking_metrics_comparison")
+            )
 
         st.markdown("---")
-        st.markdown("""
-        | 지표 | 의미 | 이상적 값 | 해석 |
-        |------|------|----------|------|
-        | **BC ↑** | Boundary Clarity | > 0.5 | 인접 청크가 의미적으로 독립적 |
-        | **CS ↓** | Chunk Stickiness | < 1.0 | 청크 그래프가 희소함 (독립적) |
-        | **std_bc ↓** | BC 표준편차 | < 0.15 | 일관된 경계 품질 |
 
-        *BC는 Semantic Distance 기반 (1 - cosine similarity), CS는 Structural Entropy 기반*
-        """)
+        # =====================================================================
+        # Detailed Test Analysis
+        # =====================================================================
+        st.markdown("### 🔬 Detailed Test Analysis")
 
-    # =========================================================================
-    # 실험 실행 가이드 (접기)
-    # =========================================================================
-    with st.expander("🚀 실험 실행 가이드", expanded=False):
-        st.markdown("""
-        ### 청킹 품질 테스트 실행 방법
+        # 페이지네이션 (10개 초과 시)
+        chunking_items = list(CHUNKING_DATA_DICT.items())
+        total_chunking_tests = len(chunking_items)
 
-        **1. Mock 모드 (빠른 테스트)**
-        ```bash
-        uv run python src/eval_chunking.py --test-id test_5 --use-mock
-        ```
-        - 단어 통계 기반 휴리스틱
-        - API 호출 없음, 즉시 완료
+        if total_chunking_tests > PAGE_SIZE:
+            col_page_info, col_page_nav = st.columns([2, 1])
 
-        **2. Real BC 모드 (OpenAI API)**
-        ```bash
-        # .env에 OPENAI_API_KEY 설정 필요
-        uv run python src/eval_chunking.py --test-id test_5 --skip-cs
-        ```
-        - GPT-4o 기반 Perplexity 계산
-        - BC: ~2×(N-1) API 호출
-        - CS 스킵으로 시간 절약
+            with col_page_info:
+                st.caption(f"총 {total_chunking_tests}개 테스트 (페이지당 {PAGE_SIZE}개)")
 
-        **3. Full 모드 (BC + CS)**
-        ```bash
-        uv run python src/eval_chunking.py --test-id test_5
-        ```
-        - BC + CS 모두 계산
-        - CS: N² API 호출 (대규모 문서는 비용 주의)
+            if "chunking_page" not in st.session_state:
+                st.session_state.chunking_page = 1
 
-        ### 예상 소요 시간 (N=350 청크 기준)
-        | 모드 | API 호출 | 예상 시간 |
-        |------|---------|----------|
-        | Mock | 0 | < 1분 |
-        | BC Only | ~700 | ~10분 |
-        | BC + CS | ~122,500 | 수 시간 |
-        """)
+            total_pages = (total_chunking_tests + PAGE_SIZE - 1) // PAGE_SIZE
+
+            with col_page_nav:
+                page = st.number_input(
+                    "Page",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=st.session_state.chunking_page,
+                    key="chunking_page_input"
+                )
+                st.session_state.chunking_page = page
+
+            paginated_chunking_items, _, _, _ = paginate_data(chunking_items, page, PAGE_SIZE)
+        else:
+            paginated_chunking_items = chunking_items
+
+        # 테스트별 상세 (Expander)
+        for test_id, test_data in paginated_chunking_items:
+            metadata = test_data.get("metadata", {})
+            title = metadata.get("title", test_id)
+            config = test_data.get("config", {})
+
+            test_num = test_id.replace("test_", "").replace("_", " ").title()
+            total_chunks = sum(p.get("chunk_count", 0) for p in test_data["parsers"].values())
+
+            expander_title = f"📦 **Test {test_num}**: {title} ({total_chunks} chunks)"
+
+            with st.expander(expander_title, expanded=False):
+                # 설정 정보
+                info_cols = st.columns([2, 1, 1])
+                with info_cols[0]:
+                    st.caption(f"📁 {title}")
+                with info_cols[1]:
+                    strategy = config.get("breakpoint_type", "semantic")
+                    st.caption(f"⚙️ Strategy: {strategy}")
+                with info_cols[2]:
+                    threshold = config.get("breakpoint_threshold", "N/A")
+                    st.caption(f"🎯 Threshold: {threshold}")
+                st.divider()
+
+                # 테이블
+                detail_rows = []
+                for parser, metrics in test_data["parsers"].items():
+                    bc_val = metrics.get("bc")
+                    cs_val = metrics.get("cs")
+                    bc_std = metrics.get("bc_std")
+
+                    detail_rows.append({
+                        "Parser": parser,
+                        "BC ↑": f"{bc_val:.4f}" if bc_val is not None else "N/A",
+                        "CS ↓": f"{cs_val:.4f}" if cs_val is not None else "N/A",
+                        "BC Std": f"±{bc_std:.4f}" if bc_std is not None else "-",
+                        "Chunks": metrics.get("chunk_count", 0),
+                    })
+                st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+                # Bar Charts
+                chart_cols = st.columns(2)
+                with chart_cols[0]:
+                    st.plotly_chart(
+                        create_chunking_thin_bar_chart(test_data, "bc", "BC (Boundary Clarity)", lower_is_better=False),
+                        use_container_width=True,
+                        config=get_chart_download_config(f"{test_id}_bc")
+                    )
+                    st.plotly_chart(
+                        create_chunking_thin_bar_chart(test_data, "cs", "CS (Chunk Stickiness)", lower_is_better=True),
+                        use_container_width=True,
+                        config=get_chart_download_config(f"{test_id}_cs")
+                    )
+                with chart_cols[1]:
+                    st.plotly_chart(
+                        create_chunking_thin_bar_chart(test_data, "chunk_count", "Chunk Count", lower_is_better=False),
+                        use_container_width=True,
+                        config=get_chart_download_config(f"{test_id}_chunks")
+                    )
+                    if any(test_data["parsers"][p].get("bc_std") for p in test_data["parsers"]):
+                        st.plotly_chart(
+                            create_chunking_thin_bar_chart(test_data, "bc_std", "BC Std (Consistency)", lower_is_better=True),
+                            use_container_width=True,
+                            config=get_chart_download_config(f"{test_id}_bc_std")
+                        )
+
 
 
 # =============================================================================

@@ -160,17 +160,26 @@ def load_parsed_files(
             file_path = parsed_dir / f"{pattern}_output{ext}"
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
-                chunks = chunk_text(
-                    content,
-                    breakpoint_type=breakpoint_type,
-                    breakpoint_threshold=breakpoint_threshold,
-                    min_chunk_size=min_chunk_size,
-                    embedding_api_url=embedding_api_url,
-                    embedding_model=embedding_model,
-                    document_id=pattern,
-                )
-                results[parser_name] = chunks
-                print(f"Loaded {parser_name}: {len(chunks)} chunks from {file_path.name}")
+
+                # Skip files with too little content
+                if len(content.strip()) < 100:
+                    print(f"Skipped {parser_name}: Content too short ({len(content.strip())} chars)")
+                    break
+
+                try:
+                    chunks = chunk_text(
+                        content,
+                        breakpoint_type=breakpoint_type,
+                        breakpoint_threshold=breakpoint_threshold,
+                        min_chunk_size=min_chunk_size,
+                        embedding_api_url=embedding_api_url,
+                        embedding_model=embedding_model,
+                        document_id=pattern,
+                    )
+                    results[parser_name] = chunks
+                    print(f"Loaded {parser_name}: {len(chunks)} chunks from {file_path.name}")
+                except Exception as e:
+                    print(f"Error chunking {parser_name}: {e}")
                 break
 
     return results
