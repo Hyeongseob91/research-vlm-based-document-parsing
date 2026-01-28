@@ -1,12 +1,14 @@
 """
 Two-Stage Parser - 2단계 파싱 파이프라인
 
-Stage 1: OCR 텍스트 추출 (pdfplumber 또는 Docling/RapidOCR)
+Stage 1: OCR 텍스트 추출 (PyMuPDF 또는 RapidOCR)
 Stage 2: LLM 텍스트 구조화 (TextStructurer)
 
-연구 가설:
-    "VLM을 통한 텍스트 구조화(2-Stage)가 단순 추출(1-Stage) 대비
-    Semantic Chunking 품질(BC↑, CS↓)을 개선한다."
+파서 구조:
+    - Text-Baseline: PyMuPDF (OCRParser)
+    - Image-Baseline: RapidOCR (RapidOCRParser)
+    - Text-Advanced: PyMuPDF + VLM 구조화
+    - Image-Advanced: RapidOCR + VLM 구조화
 
 Architecture:
     ┌─────────────────────────────────────────────────────────────┐
@@ -19,7 +21,7 @@ Architecture:
     │       ├─── "digital" ──►  parse_text_pdf()                  │
     │       │                      │                              │
     │       │                      ▼                              │
-    │       │                   pdfplumber (Stage 1)              │
+    │       │                   PyMuPDF (Stage 1)                 │
     │       │                      │                              │
     │       │                      ▼                              │
     │       │                   TextStructurer (Stage 2)          │
@@ -30,7 +32,7 @@ Architecture:
     │       └─── "scanned" ──►  parse_scanned_pdf()               │
     │                              │                              │
     │                              ▼                              │
-    │                           Docling/RapidOCR (Stage 1)        │
+    │                           RapidOCR (Stage 1)                │
     │                              │                              │
     │                              ▼                              │
     │                           TextStructurer (Stage 2)          │
@@ -51,17 +53,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .ocr_parser import OCRParser
+from .ocr_parser import OCRParser, RapidOCRParser, check_rapidocr_available
 from .text_structurer import TextStructurer, TextStructurerResult
-
-# Docling은 선택적 의존성
-try:
-    from .docling_parser import DoclingParser, check_docling_available
-    DOCLING_AVAILABLE = check_docling_available()
-except ImportError:
-    DOCLING_AVAILABLE = False
-    DoclingParser = None
-    check_docling_available = lambda: False
 
 
 # ==============================================================================
@@ -76,7 +69,7 @@ class TwoStageResult:
         success: 전체 파이프라인 성공 여부
         content: 최종 구조화된 텍스트 (Stage 2 출력)
         stage1_content: Stage 1 (OCR) 원본 텍스트
-        stage1_parser: Stage 1 파서 이름 ("pdfplumber" | "docling")
+        stage1_parser: Stage 1 파서 이름 ("pymupdf" | "rapidocr")
         stage2_applied: VLM 구조화 적용 여부
         elapsed_time: 전체 처리 시간 (초)
         stage1_time: Stage 1 처리 시간 (초) - Tech Report용
@@ -119,11 +112,11 @@ class TwoStageResult:
 # ==============================================================================
 
 class TwoStageParser:
-    """2-Stage 문서 파서
+    """2-Stage 문서 파서 (Advanced 파서)
 
     Stage 1: OCR 텍스트 추출
-        - Text PDF: pdfplumber
-        - Scanned PDF: Docling + RapidOCR
+        - Text PDF: PyMuPDF (OCRParser)
+        - Scanned PDF: RapidOCR (RapidOCRParser)
 
     Stage 2: LLM 텍스트 구조화
         - TextStructurer (현재: Qwen3-VL API)
@@ -162,8 +155,19 @@ class TwoStageParser:
         )
         self.skip_stage2_on_failure = skip_stage2_on_failure
 
-        # Docling 파서 (설치된 경우에만)
-        self.docling_parser = DoclingParser(ocr_enabled=True) if DOCLING_AVAILABLE else None
+        # RapidOCR 파서 (설치된 경우에만)
+        self._rapidocr_parser = None
+        self._rapidocr_available = check_rapidocr_available()
+
+    @property
+    def rapidocr_parser(self) -> Optional[RapidOCRParser]:
+        """RapidOCR 파서 (lazy initialization)"""
+        if self._rapidocr_parser is None and self._rapidocr_available:
+            try:
+                self._rapidocr_parser = RapidOCRParser()
+            except ImportError:
+                self._rapidocr_available = False
+        return self._rapidocr_parser
 
     # ==========================================================================
     # Public Methods (Entry Points)
@@ -190,13 +194,13 @@ class TwoStageParser:
             result.pdf_type = pdf_type
             return result
         else:
-            # unknown: pdfplumber로 시도
+            # unknown: PyMuPDF로 시도
             result = self.parse_text_pdf(pdf_bytes)
             result.pdf_type = "unknown"
             return result
 
     def parse_text_pdf(self, pdf_bytes: bytes) -> TwoStageResult:
-        """Text PDF 파싱 (pdfplumber → VLM 구조화)
+        """Text PDF 파싱 (PyMuPDF → VLM 구조화) - Text-Advanced
 
         Args:
             pdf_bytes: PDF 파일 바이트 데이터
@@ -207,7 +211,7 @@ class TwoStageParser:
         total_start = time.time()
 
         # =====================================================================
-        # Stage 1: pdfplumber로 텍스트 추출
+        # Stage 1: PyMuPDF로 텍스트 추출
         # =====================================================================
         stage1_start = time.time()
         ocr_result = self.ocr_parser.parse_pdf(pdf_bytes)
@@ -218,7 +222,7 @@ class TwoStageParser:
                 success=False,
                 content="",
                 stage1_content="",
-                stage1_parser="pdfplumber",
+                stage1_parser="pymupdf",
                 stage2_applied=False,
                 elapsed_time=time.time() - total_start,
                 stage1_time=stage1_time,
@@ -235,7 +239,7 @@ class TwoStageParser:
                 success=False,
                 content="",
                 stage1_content=stage1_content,
-                stage1_parser="pdfplumber",
+                stage1_parser="pymupdf",
                 stage2_applied=False,
                 elapsed_time=time.time() - total_start,
                 stage1_time=stage1_time,
@@ -258,7 +262,7 @@ class TwoStageParser:
                     success=True,  # Stage 1은 성공
                     content=stage1_content,  # Stage 1 결과 사용
                     stage1_content=stage1_content,
-                    stage1_parser="pdfplumber",
+                    stage1_parser="pymupdf",
                     stage2_applied=False,
                     elapsed_time=time.time() - total_start,
                     stage1_time=stage1_time,
@@ -271,7 +275,7 @@ class TwoStageParser:
                     success=False,
                     content="",
                     stage1_content=stage1_content,
-                    stage1_parser="pdfplumber",
+                    stage1_parser="pymupdf",
                     stage2_applied=False,
                     elapsed_time=time.time() - total_start,
                     stage1_time=stage1_time,
@@ -285,7 +289,7 @@ class TwoStageParser:
             success=True,
             content=structurer_result.content,
             stage1_content=stage1_content,
-            stage1_parser="pdfplumber",
+            stage1_parser="pymupdf",
             stage2_applied=True,
             elapsed_time=time.time() - total_start,
             stage1_time=stage1_time,
@@ -294,7 +298,7 @@ class TwoStageParser:
         )
 
     def parse_scanned_pdf(self, pdf_bytes: bytes) -> TwoStageResult:
-        """Scanned PDF 파싱 (Docling/RapidOCR → VLM 구조화)
+        """Scanned PDF 파싱 (RapidOCR → VLM 구조화) - Image-Advanced
 
         Args:
             pdf_bytes: PDF 파일 바이트 데이터
@@ -305,42 +309,41 @@ class TwoStageParser:
         total_start = time.time()
 
         # =====================================================================
-        # Stage 1: Docling + RapidOCR로 텍스트 추출
+        # Stage 1: RapidOCR로 텍스트 추출
         # =====================================================================
-        if not DOCLING_AVAILABLE or self.docling_parser is None:
+        if not self._rapidocr_available or self.rapidocr_parser is None:
             return TwoStageResult(
                 success=False,
                 content="",
                 stage1_content="",
-                stage1_parser="docling",
+                stage1_parser="rapidocr",
                 stage2_applied=False,
                 elapsed_time=time.time() - total_start,
                 stage1_time=0.0,
                 stage2_time=0.0,
                 page_count=0,
-                error="Docling이 설치되지 않았습니다. pip install docling"
+                error="RapidOCR가 설치되지 않았습니다. pip install rapidocr-pdf[onnxruntime]"
             )
 
         stage1_start = time.time()
-        docling_result = self.docling_parser.parse_pdf(pdf_bytes)
+        ocr_result = self.rapidocr_parser.parse_pdf(pdf_bytes)
         stage1_time = time.time() - stage1_start
 
-        if not docling_result.success:
+        if not ocr_result.success:
             return TwoStageResult(
                 success=False,
                 content="",
                 stage1_content="",
-                stage1_parser="docling",
+                stage1_parser="rapidocr",
                 stage2_applied=False,
                 elapsed_time=time.time() - total_start,
                 stage1_time=stage1_time,
                 stage2_time=0.0,
                 page_count=0,
-                error=f"Stage 1 실패: {docling_result.error}"
+                error=f"Stage 1 실패: {ocr_result.error}"
             )
 
-        # Docling은 markdown 출력을 우선 사용
-        stage1_content = docling_result.markdown or docling_result.content
+        stage1_content = ocr_result.content
 
         # Stage 1 결과가 비어있으면 Stage 2 스킵
         if not stage1_content.strip():
@@ -348,12 +351,12 @@ class TwoStageParser:
                 success=False,
                 content="",
                 stage1_content=stage1_content,
-                stage1_parser="docling",
+                stage1_parser="rapidocr",
                 stage2_applied=False,
                 elapsed_time=time.time() - total_start,
                 stage1_time=stage1_time,
                 stage2_time=0.0,
-                page_count=docling_result.page_count,
+                page_count=ocr_result.page_count,
                 error="Stage 1 결과가 비어있습니다."
             )
 
@@ -370,12 +373,12 @@ class TwoStageParser:
                     success=True,
                     content=stage1_content,
                     stage1_content=stage1_content,
-                    stage1_parser="docling",
+                    stage1_parser="rapidocr",
                     stage2_applied=False,
                     elapsed_time=time.time() - total_start,
                     stage1_time=stage1_time,
                     stage2_time=stage2_time,
-                    page_count=docling_result.page_count,
+                    page_count=ocr_result.page_count,
                     error=f"Stage 2 실패 (Stage 1 결과 반환): {structurer_result.error}"
                 )
             else:
@@ -383,12 +386,12 @@ class TwoStageParser:
                     success=False,
                     content="",
                     stage1_content=stage1_content,
-                    stage1_parser="docling",
+                    stage1_parser="rapidocr",
                     stage2_applied=False,
                     elapsed_time=time.time() - total_start,
                     stage1_time=stage1_time,
                     stage2_time=stage2_time,
-                    page_count=docling_result.page_count,
+                    page_count=ocr_result.page_count,
                     error=f"Stage 2 실패: {structurer_result.error}"
                 )
 
@@ -397,12 +400,12 @@ class TwoStageParser:
             success=True,
             content=structurer_result.content,
             stage1_content=stage1_content,
-            stage1_parser="docling",
+            stage1_parser="rapidocr",
             stage2_applied=True,
             elapsed_time=time.time() - total_start,
             stage1_time=stage1_time,
             stage2_time=stage2_time,
-            page_count=docling_result.page_count
+            page_count=ocr_result.page_count
         )
 
     # ==========================================================================
@@ -421,6 +424,6 @@ class TwoStageParser:
         return self.ocr_parser.detect_pdf_type(pdf_bytes)
 
     @property
-    def docling_available(self) -> bool:
-        """Docling 사용 가능 여부"""
-        return DOCLING_AVAILABLE
+    def rapidocr_available(self) -> bool:
+        """RapidOCR 사용 가능 여부"""
+        return self._rapidocr_available
