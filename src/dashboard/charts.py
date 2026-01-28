@@ -333,7 +333,7 @@ def create_dual_box_plot(
         fig.add_trace(go.Box(
             y=df["cs"],
             name="CS",
-            marker_color=COLORS["docling_color"],
+            marker_color=COLORS["ocr_image_color"],  # Amber
             boxmean=True,
         ), row=1, col=2)
 
@@ -393,7 +393,7 @@ def create_scatter_plot(
             df, x=x, y=y,
             color=color_by,
             hover_data=["test_name"] if "test_name" in df.columns else None,
-            color_discrete_sequence=[COLORS["vlm_color"], COLORS["ocr_color"], COLORS["docling_color"]],
+            color_discrete_sequence=[COLORS["vlm_color"], COLORS["ocr_color"], COLORS["ocr_image_color"]],
         )
     else:
         fig = go.Figure()

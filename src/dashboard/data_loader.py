@@ -53,7 +53,9 @@ class TestResult:
 
     @property
     def parsers(self) -> List[str]:
-        return list(self.evaluation.get("results", {}).keys())
+        # Support both "parsers" (new format) and "results" (legacy format)
+        parser_results = self.evaluation.get("parsers", {}) or self.evaluation.get("results", {})
+        return list(parser_results.keys())
 
 
 # =============================================================================
@@ -249,7 +251,9 @@ def get_parsing_summary_df(data: Dict[str, Any]) -> pd.DataFrame:
         eval_data = test_data.get("evaluation", {})
         source_file = eval_data.get("pdf", "")
 
-        for parser, metrics in eval_data.get("results", {}).items():
+        # Support both "parsers" (new format) and "results" (legacy format)
+        parser_results = eval_data.get("parsers", {}) or eval_data.get("results", {})
+        for parser, metrics in parser_results.items():
             cer = metrics.get("cer")
             wer = metrics.get("wer")
 
@@ -350,7 +354,9 @@ def get_test_detail_df(data: Dict[str, Any], test_id: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     rows = []
-    for parser, metrics in eval_data.get("results", {}).items():
+    # Support both "parsers" (new format) and "results" (legacy format)
+    parser_results = eval_data.get("parsers", {}) or eval_data.get("results", {})
+    for parser, metrics in parser_results.items():
         rows.append({
             "Parser": parser,
             "Success": metrics.get("success", False),
@@ -489,7 +495,7 @@ def get_parsing_data(data: Dict[str, Any]) -> Dict[str, Dict]:
                 "language": language,
                 "has_text_layer": has_text_layer,
                 "source_path": eval_data.get("pdf", ""),
-                "parsers": eval_data.get("results", {}),
+                "parsers": eval_data.get("parsers", {}) or eval_data.get("results", {}),
                 "metadata": metadata,
             }
         return result
