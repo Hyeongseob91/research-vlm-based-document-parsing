@@ -48,9 +48,9 @@ try:
         Chunk,
     )
     from src.chunking.metrics import (
-        LLMClient,
-        MockLLMClient,
-        OpenAIClient,
+        EmbeddingClient,
+        MockEmbeddingClient,
+        create_embedding_client,
         evaluate_chunking,
         ChunkingMetrics,
     )
@@ -71,9 +71,9 @@ except ImportError:
         Chunk,
     )
     from chunking.metrics import (
-        LLMClient,
-        MockLLMClient,
-        OpenAIClient,
+        EmbeddingClient,
+        MockEmbeddingClient,
+        create_embedding_client,
         evaluate_chunking,
         ChunkingMetrics,
     )
@@ -96,6 +96,7 @@ def chunk_text(
     strategy: ChunkingStrategy = ChunkingStrategy.SEMANTIC,
     chunk_size: int = 500,
     chunk_overlap: int = 50,
+    semantic_threshold: float = 0.9,
     document_id: str = "doc"
 ) -> list[Chunk]:
     """Chunk text using the specified strategy.
@@ -105,6 +106,7 @@ def chunk_text(
         strategy: Chunking strategy
         chunk_size: Target chunk size
         chunk_overlap: Overlap between chunks
+        semantic_threshold: Semantic chunker breakpoint threshold (default: 0.9)
         document_id: Document identifier for chunk IDs
 
     Returns:
@@ -114,6 +116,7 @@ def chunk_text(
         strategy=strategy,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        semantic_threshold=semantic_threshold,
     )
 
     chunker = create_chunker(config)
@@ -245,6 +248,8 @@ def load_parsed_files(parsed_dir: Path) -> dict[str, list[Chunk]]:
     - vlm_output.md or vlm_output.txt
     - ocr-text_output.md or ocr-text_output.txt
     - ocr-image_output.md or ocr-image_output.txt
+    - twostage-text_output.md or twostage-text_output.txt
+    - twostage-image_output.md or twostage-image_output.txt
 
     Args:
         parsed_dir: Directory containing parsed output files
@@ -259,6 +264,8 @@ def load_parsed_files(parsed_dir: Path) -> dict[str, list[Chunk]]:
         "vlm": "VLM",
         "ocr-text": "OCR-Text",
         "ocr-image": "OCR-Image",
+        "twostage-text": "TwoStage-Text",
+        "twostage-image": "TwoStage-Image",
     }
 
     for pattern, parser_name in patterns.items():
@@ -281,18 +288,18 @@ def load_parsed_files(parsed_dir: Path) -> dict[str, list[Chunk]]:
 
 def evaluate_all(
     chunk_results: dict[str, list[Chunk]],
-    llm_client: LLMClient | MockLLMClient | None = None,
+    embedding_client: EmbeddingClient | MockEmbeddingClient | None = None,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     calculate_cs: bool = True,
     verbose: bool = False
 ) -> dict[str, ChunkingMetrics]:
-    """Evaluate chunking quality for all parsers.
+    """Evaluate chunking quality for all parsers using semantic distance.
 
     Args:
         chunk_results: Dictionary mapping parser name to chunks
-        llm_client: LLM client for perplexity calculation
-        threshold_k: CS threshold
+        embedding_client: Embedding client for semantic distance calculation
+        threshold_k: CS threshold (similarity >= threshold keeps edge)
         graph_type: CS graph type ("complete" or "incomplete")
         calculate_cs: Whether to calculate CS (can be slow)
         verbose: Print verbose output
@@ -300,9 +307,9 @@ def evaluate_all(
     Returns:
         Dictionary mapping parser name to ChunkingMetrics
     """
-    if llm_client is None:
-        print("Note: Using MockLLMClient (no API configured)")
-        llm_client = MockLLMClient()
+    if embedding_client is None:
+        print("Note: Using MockEmbeddingClient (no model loaded)")
+        embedding_client = MockEmbeddingClient()
 
     evaluation = {}
 
@@ -317,7 +324,7 @@ def evaluate_all(
 
         metrics = evaluate_chunking(
             chunks=chunks,
-            llm_client=llm_client,
+            embedding_client=embedding_client,
             threshold_k=threshold_k,
             graph_type=graph_type,
             calculate_cs_flag=calculate_cs,
@@ -468,9 +475,9 @@ def scan_results_folders(results_dir: Path = Path("results")) -> list[dict]:
             print(f"⚠️ {test_id}: evaluation.json 없음 (파싱 먼저 실행 필요)")
             continue
 
-        # Find parsed output files
+        # Find parsed output files (including TwoStage parsers)
         parsers = []
-        for pattern in ["vlm", "ocr-text", "ocr-image"]:
+        for pattern in ["vlm", "ocr-text", "ocr-image", "twostage-text", "twostage-image"]:
             for ext in [".txt", ".md"]:
                 output_file = folder / f"{pattern}_output{ext}"
                 if output_file.exists():
@@ -500,7 +507,8 @@ def run_single_chunking_test(
     strategy: ChunkingStrategy = ChunkingStrategy.SEMANTIC,
     chunk_size: int = 500,
     chunk_overlap: int = 50,
-    llm_client=None,
+    semantic_threshold: float = 0.9,
+    embedding_client: EmbeddingClient | MockEmbeddingClient | None = None,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     calculate_cs: bool = True,
@@ -518,7 +526,16 @@ def run_single_chunking_test(
     # Load parsed files
     chunk_results = {}
 
-    for pattern, parser_name in [("vlm", "VLM"), ("ocr-text", "OCR-Text"), ("ocr-image", "OCR-Image")]:
+    # Include TwoStage parsers in the pattern list
+    parser_patterns = [
+        ("vlm", "VLM"),
+        ("ocr-text", "OCR-Text"),
+        ("ocr-image", "OCR-Image"),
+        ("twostage-text", "TwoStage-Text"),
+        ("twostage-image", "TwoStage-Image"),
+    ]
+
+    for pattern, parser_name in parser_patterns:
         for ext in [".txt", ".md"]:
             output_file = test_folder / f"{pattern}_output{ext}"
             if output_file.exists():
@@ -529,6 +546,7 @@ def run_single_chunking_test(
                         strategy=strategy,
                         chunk_size=chunk_size,
                         chunk_overlap=chunk_overlap,
+                        semantic_threshold=semantic_threshold,
                         document_id=pattern
                     )
                     chunk_results[parser_name] = chunks
@@ -542,7 +560,7 @@ def run_single_chunking_test(
     # Evaluate
     evaluation = evaluate_all(
         chunk_results,
-        llm_client=llm_client,
+        embedding_client=embedding_client,
         threshold_k=threshold_k,
         graph_type=graph_type,
         calculate_cs=calculate_cs,
@@ -557,13 +575,13 @@ def run_all_chunking_tests(
     strategy: str = "semantic",
     chunk_size: int = 500,
     chunk_overlap: int = 50,
-    llm_model: str = "gpt-4o",
+    semantic_threshold: float = 0.9,
+    embedding_model: str = "jhgan/ko-sroberta-multitask",
     use_mock: bool = False,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     skip_cs: bool = False,
-    verbose: bool = False,
-    openai_api_key: Optional[str] = None
+    verbose: bool = False
 ) -> dict:
     """Run chunking evaluation on all test folders in results/.
 
@@ -578,24 +596,25 @@ def run_all_chunking_tests(
         return {}
 
     print("=" * 60)
-    print("🔬 Chunking Evaluation - Batch Test")
+    print("🔬 Chunking Evaluation - Batch Test (Semantic Distance)")
     print("=" * 60)
     print(f"📁 결과 폴더: {results_dir}")
     print(f"📊 테스트 수: {len(test_folders)}")
     print(f"📐 Strategy: {strategy}")
     print(f"📏 Chunk Size: {chunk_size}, Overlap: {chunk_overlap}")
+    print(f"🎯 Semantic Threshold: {semantic_threshold}")
     print()
 
     for info in test_folders:
         parser_names = [p["name"] for p in info["parsers"]]
         print(f"  - {info['test_id']}: {', '.join(parser_names)}")
 
-    # Create LLM client
-    llm_client = create_llm_client(llm_model, None, use_mock, openai_api_key)
+    # Create embedding client
+    embedding_client = create_embedding_client(model=embedding_model, use_mock=use_mock)
     if use_mock:
-        print("\n⚠️ MockLLMClient 사용 (근사값)")
-    elif "gpt" in llm_model.lower():
-        print(f"\n🤖 OpenAI {llm_model} 사용")
+        print("\n⚠️ MockEmbeddingClient 사용 (단어 기반 근사값)")
+    else:
+        print(f"\n🔤 Embedding model: {embedding_model}")
 
     all_results = {}
     strat = ChunkingStrategy(strategy)
@@ -604,9 +623,10 @@ def run_all_chunking_tests(
         "strategy": strategy,
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
+        "semantic_threshold": semantic_threshold,
         "graph_type": graph_type,
         "threshold_k": threshold_k,
-        "llm_model": llm_model,
+        "embedding_model": embedding_model,
         "use_mock": use_mock,
     }
 
@@ -624,7 +644,8 @@ def run_all_chunking_tests(
             strategy=strat,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            llm_client=llm_client,
+            semantic_threshold=semantic_threshold,
+            embedding_client=embedding_client,
             threshold_k=threshold_k,
             graph_type=graph_type,
             calculate_cs=not skip_cs,
@@ -666,56 +687,15 @@ def run_all_chunking_tests(
 # CLI
 # =============================================================================
 
-def create_llm_client(
-    llm_model: str,
-    llm_api_url: Optional[str] = None,
-    use_mock: bool = False,
-    openai_api_key: Optional[str] = None
-) -> LLMClient | MockLLMClient | OpenAIClient:
-    """Create LLM client based on configuration.
-
-    Args:
-        llm_model: Model identifier
-        llm_api_url: API URL (optional, uses default if not provided)
-        use_mock: Use mock client instead of real API
-        openai_api_key: OpenAI API key (for OpenAI models)
-
-    Returns:
-        LLM client instance
-    """
-    if use_mock:
-        return MockLLMClient()
-
-    # OpenAI models use the OpenAI client
-    openai_models = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
-    if llm_model.lower() in openai_models:
-        return OpenAIClient(
-            model=llm_model,
-            api_key=openai_api_key,
-        )
-
-    # Default API URLs based on model (local models)
-    default_urls = {
-        "qwen2.5-7b": "http://localhost:8000/v1/completions",
-        "qwen2.5-14b": "http://localhost:8000/v1/completions",
-    }
-
-    api_url = llm_api_url or default_urls.get(llm_model.lower(), "http://localhost:8000/v1/completions")
-
-    return LLMClient(
-        api_url=api_url,
-        model=llm_model,
-    )
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Chunking Evaluation CLI - MoC-based quality metrics",
+        description="Chunking Evaluation CLI - Semantic Distance-based BC/CS metrics",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Metrics:
-  BC (Boundary Clarity):  Higher is better - chunks are independent
-  CS (Chunk Stickiness):  Lower is better - less inter-chunk dependency
+Metrics (Semantic Distance based):
+  BC (Boundary Clarity):  Higher is better - chunks are semantically independent
+  CS (Chunk Stickiness):  Lower is better - less semantic similarity between chunks
 
 Examples:
   # 전체 테스트 (results/ 폴더의 모든 파싱 결과)
@@ -792,6 +772,12 @@ Examples:
         default=50,
         help="Overlap between chunks (default: 50)"
     )
+    parser.add_argument(
+        "--semantic-threshold",
+        type=float,
+        default=0.9,
+        help="Semantic chunker breakpoint threshold (default: 0.9)"
+    )
 
     # Parser options
     parser.add_argument(
@@ -805,26 +791,16 @@ Examples:
         help="Skip Docling (OCR-Image) parser"
     )
 
-    # LLM options
+    # Embedding model options
     parser.add_argument(
-        "--llm-model",
-        default="gpt-4o",
-        help="LLM model for perplexity calculation (default: gpt-4o)"
-    )
-    parser.add_argument(
-        "--llm-api-url",
-        default=None,
-        help="LLM API URL (default: auto-detect based on model)"
-    )
-    parser.add_argument(
-        "--openai-api-key",
-        default=None,
-        help="OpenAI API key (or set OPENAI_API_KEY env var)"
+        "--embedding-model",
+        default="jhgan/ko-sroberta-multitask",
+        help="Sentence transformer model for embeddings (default: jhgan/ko-sroberta-multitask)"
     )
     parser.add_argument(
         "--use-mock",
         action="store_true",
-        help="Use mock LLM client (no API required, for testing)"
+        help="Use mock embedding client (word-based heuristic, for testing)"
     )
 
     # CS options
@@ -862,13 +838,13 @@ Examples:
             strategy=args.strategy,
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
-            llm_model=args.llm_model,
+            semantic_threshold=args.semantic_threshold,
+            embedding_model=args.embedding_model,
             use_mock=args.use_mock,
             threshold_k=args.threshold_k,
             graph_type=args.graph_type,
             skip_cs=args.skip_cs,
-            verbose=args.verbose,
-            openai_api_key=args.openai_api_key
+            verbose=args.verbose
         )
         print("\nDone!")
         return
@@ -930,6 +906,7 @@ Examples:
                             strategy=strat,
                             chunk_size=args.chunk_size,
                             chunk_overlap=args.chunk_overlap,
+                            semantic_threshold=args.semantic_threshold,
                             document_id=f"{parser_name.lower()}_{strat_name}"
                         )
                         result_name = f"{parser_name}_{strat_name}"
@@ -943,6 +920,7 @@ Examples:
                     strategy=ChunkingStrategy(args.strategy),
                     chunk_size=args.chunk_size,
                     chunk_overlap=args.chunk_overlap,
+                    semantic_threshold=args.semantic_threshold,
                     document_id=parser_name.lower()
                 )
                 chunk_results[parser_name] = chunks
@@ -952,23 +930,21 @@ Examples:
         print("Error: No chunks to evaluate")
         sys.exit(1)
 
-    # Create LLM client
-    llm_client = create_llm_client(
-        args.llm_model,
-        args.llm_api_url,
-        args.use_mock,
-        args.openai_api_key
+    # Create embedding client
+    embedding_client = create_embedding_client(
+        model=args.embedding_model,
+        use_mock=args.use_mock
     )
 
     if args.use_mock:
-        print("\nNote: Using MockLLMClient (results are approximate)")
-    elif "gpt" in args.llm_model.lower():
-        print(f"\n🤖 Using OpenAI {args.llm_model}")
+        print("\nNote: Using MockEmbeddingClient (word-based heuristic)")
+    else:
+        print(f"\n🔤 Embedding model: {args.embedding_model}")
 
     # Evaluate
     evaluation = evaluate_all(
         chunk_results,
-        llm_client=llm_client,
+        embedding_client=embedding_client,
         threshold_k=args.threshold_k,
         graph_type=args.graph_type,
         calculate_cs=not args.skip_cs,
@@ -985,9 +961,10 @@ Examples:
             "strategy": args.strategy,
             "chunk_size": args.chunk_size,
             "chunk_overlap": args.chunk_overlap,
+            "semantic_threshold": args.semantic_threshold,
             "graph_type": args.graph_type,
             "threshold_k": args.threshold_k,
-            "llm_model": args.llm_model,
+            "embedding_model": args.embedding_model,
             "use_mock": args.use_mock,
         }
 

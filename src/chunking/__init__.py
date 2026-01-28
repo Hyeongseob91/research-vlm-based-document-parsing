@@ -4,7 +4,7 @@ Semantic Chunking Module for VLM Document Parsing Evaluation
 This module provides:
 - Text chunking strategies (fixed, recursive, semantic, hierarchical)
 - Label-free quality metrics (BC, CS) based on MoC paper (arXiv:2503.09600v2)
-- LLM client for perplexity-based metric calculation
+- Embedding-based semantic distance calculation for BC/CS metrics
 """
 
 from .chunker import (
@@ -23,13 +23,14 @@ from .metrics import (
     BCScore,
     CSScore,
     ChunkingMetrics,
-    # LLM clients
-    LLMClient,
-    MockLLMClient,
+    # Embedding clients
+    EmbeddingClient,
+    MockEmbeddingClient,
+    create_embedding_client,
     # Functions
     calculate_bc,
     calculate_cs,
-    calculate_edge_weight,
+    calculate_edge_weight_semantic,
     calculate_structural_entropy,
     build_chunk_graph,
     evaluate_chunking,
@@ -59,13 +60,14 @@ __all__ = [
     "BCScore",
     "CSScore",
     "ChunkingMetrics",
-    # Metrics - LLM clients
-    "LLMClient",
-    "MockLLMClient",
+    # Metrics - Embedding clients
+    "EmbeddingClient",
+    "MockEmbeddingClient",
+    "create_embedding_client",
     # Metrics - Functions
     "calculate_bc",
     "calculate_cs",
-    "calculate_edge_weight",
+    "calculate_edge_weight_semantic",
     "calculate_structural_entropy",
     "build_chunk_graph",
     "evaluate_chunking",

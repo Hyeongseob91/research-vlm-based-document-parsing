@@ -23,9 +23,10 @@ class ChunkingStrategy(Enum):
 @dataclass
 class ChunkerConfig:
     """Configuration for text chunker."""
-    strategy: ChunkingStrategy = ChunkingStrategy.RECURSIVE_CHARACTER
+    strategy: ChunkingStrategy = ChunkingStrategy.SEMANTIC
     chunk_size: int = 500
     chunk_overlap: int = 50
+    semantic_threshold: float = 0.9  # Semantic chunker breakpoint threshold
     separators: list[str] = field(default_factory=lambda: ["\n\n", "\n", ". ", " "])
     length_function: str = "character_count"  # character_count, token_count
     keep_separator: bool = True
@@ -37,6 +38,7 @@ class ChunkerConfig:
             "strategy": self.strategy.value,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
+            "semantic_threshold": self.semantic_threshold,
             "separators": self.separators,
             "length_function": self.length_function,
             "keep_separator": self.keep_separator,
@@ -295,7 +297,7 @@ class SemanticChunker(TextChunker):
         embeddings = embedder.encode(sentences, convert_to_numpy=True)
 
         # Calculate similarity between consecutive sentences
-        breakpoints = self._find_breakpoints(embeddings)
+        breakpoints = self._find_breakpoints(embeddings, threshold=self.config.semantic_threshold)
 
         # Create chunks at breakpoints
         chunks = []
@@ -338,7 +340,7 @@ class SemanticChunker(TextChunker):
         sentences = re.split(pattern, text)
         return [s.strip() for s in sentences if s.strip()]
 
-    def _find_breakpoints(self, embeddings, threshold: float = 0.3) -> set[int]:
+    def _find_breakpoints(self, embeddings, threshold: float = 0.9) -> set[int]:
         """Find indices where semantic shifts occur."""
         import numpy as np
 
