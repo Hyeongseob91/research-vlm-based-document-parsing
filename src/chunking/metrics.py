@@ -8,6 +8,11 @@ Key Metrics:
 - BC (Boundary Clarity): Measures independence between adjacent chunks
 - CS (Chunk Stickiness): Measures overall graph connectivity via Structural Entropy
 
+Implementation:
+- Uses Semantic Distance (embedding cosine similarity) instead of perplexity
+- OpenAI API cannot provide input token logprobs, so perplexity-based approach is not feasible
+- Semantic Distance provides equivalent evaluation with better API compatibility
+
 Advantages over traditional metrics:
 - No Ground Truth required
 - Repeatable measurements in production
@@ -15,7 +20,7 @@ Advantages over traditional metrics:
 """
 
 import math
-import httpx
+import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 from collections.abc import Sequence
@@ -90,14 +95,213 @@ class ChunkingMetrics:
 
 
 # =============================================================================
-# LLM Client for Perplexity Calculation
+# Embedding Client for Semantic Distance Calculation
+# =============================================================================
+
+class EmbeddingClient:
+    """Embedding-based client for semantic distance calculation.
+
+    Uses sentence-transformers for computing embeddings and cosine similarity.
+    This approach is used instead of perplexity because OpenAI API cannot
+    provide input token logprobs needed for true perplexity calculation.
+    """
+
+    def __init__(
+        self,
+        model: str = "jhgan/ko-sroberta-multitask",
+        device: Optional[str] = None,
+        cache_embeddings: bool = True
+    ):
+        """Initialize embedding client.
+
+        Args:
+            model: Sentence transformer model name
+            device: Device to use ('cuda', 'cpu', or None for auto)
+            cache_embeddings: Whether to cache embeddings for repeated texts
+        """
+        self.model_name = model
+        self.device = device
+        self.cache_embeddings = cache_embeddings
+        self._model = None
+        self._cache: dict[str, np.ndarray] = {}
+
+    def _get_model(self):
+        """Lazy load embedding model."""
+        if self._model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._model = SentenceTransformer(self.model_name, device=self.device)
+            except ImportError:
+                raise ImportError(
+                    "sentence-transformers required for semantic distance calculation. "
+                    "Install with: pip install sentence-transformers"
+                )
+        return self._model
+
+    def get_embedding(self, text: str) -> np.ndarray:
+        """Get embedding for a text.
+
+        Args:
+            text: Text to embed
+
+        Returns:
+            Embedding vector as numpy array
+        """
+        if not text.strip():
+            return np.zeros(384)  # Default embedding dimension
+
+        # Check cache
+        if self.cache_embeddings and text in self._cache:
+            return self._cache[text]
+
+        model = self._get_model()
+        embedding = model.encode(text, convert_to_numpy=True)
+
+        # Cache result
+        if self.cache_embeddings:
+            self._cache[text] = embedding
+
+        return embedding
+
+    def get_embeddings_batch(self, texts: list[str]) -> np.ndarray:
+        """Get embeddings for multiple texts.
+
+        Args:
+            texts: List of texts to embed
+
+        Returns:
+            Array of embeddings (n_texts, embedding_dim)
+        """
+        if not texts:
+            return np.array([])
+
+        # Check which texts need embedding
+        uncached_indices = []
+        uncached_texts = []
+        results = [None] * len(texts)
+
+        for i, text in enumerate(texts):
+            if self.cache_embeddings and text in self._cache:
+                results[i] = self._cache[text]
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(text)
+
+        # Embed uncached texts in batch
+        if uncached_texts:
+            model = self._get_model()
+            new_embeddings = model.encode(uncached_texts, convert_to_numpy=True)
+
+            for idx, text, emb in zip(uncached_indices, uncached_texts, new_embeddings):
+                results[idx] = emb
+                if self.cache_embeddings:
+                    self._cache[text] = emb
+
+        return np.array(results)
+
+    def cosine_similarity(self, text1: str, text2: str) -> float:
+        """Calculate cosine similarity between two texts.
+
+        Args:
+            text1: First text
+            text2: Second text
+
+        Returns:
+            Cosine similarity in range [-1, 1] (typically [0, 1] for text)
+        """
+        emb1 = self.get_embedding(text1)
+        emb2 = self.get_embedding(text2)
+
+        norm1 = np.linalg.norm(emb1)
+        norm2 = np.linalg.norm(emb2)
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        return float(np.dot(emb1, emb2) / (norm1 * norm2))
+
+    def semantic_distance(self, text1: str, text2: str) -> float:
+        """Calculate semantic distance between two texts.
+
+        Semantic distance = 1 - cosine_similarity
+
+        Args:
+            text1: First text
+            text2: Second text
+
+        Returns:
+            Semantic distance in range [0, 2] (typically [0, 1] for text)
+        """
+        return 1.0 - self.cosine_similarity(text1, text2)
+
+    def clear_cache(self):
+        """Clear the embedding cache."""
+        self._cache = {}
+
+
+class MockEmbeddingClient:
+    """Mock embedding client for testing without actual model.
+
+    Uses simple word overlap heuristics for similarity calculation.
+    """
+
+    def __init__(self):
+        pass
+
+    def get_embedding(self, text: str) -> np.ndarray:
+        """Mock embedding using bag-of-words approach."""
+        if not text.strip():
+            return np.zeros(100)
+
+        words = text.lower().split()
+        # Simple hash-based embedding
+        embedding = np.zeros(100)
+        for word in words:
+            idx = hash(word) % 100
+            embedding[idx] += 1
+
+        # Normalize
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+
+        return embedding
+
+    def get_embeddings_batch(self, texts: list[str]) -> np.ndarray:
+        """Mock batch embedding."""
+        return np.array([self.get_embedding(t) for t in texts])
+
+    def cosine_similarity(self, text1: str, text2: str) -> float:
+        """Calculate cosine similarity using mock embeddings."""
+        emb1 = self.get_embedding(text1)
+        emb2 = self.get_embedding(text2)
+
+        norm1 = np.linalg.norm(emb1)
+        norm2 = np.linalg.norm(emb2)
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        return float(np.dot(emb1, emb2) / (norm1 * norm2))
+
+    def semantic_distance(self, text1: str, text2: str) -> float:
+        """Calculate semantic distance."""
+        return 1.0 - self.cosine_similarity(text1, text2)
+
+    def clear_cache(self):
+        """No-op for mock client."""
+        pass
+
+
+# =============================================================================
+# Legacy LLM Clients (kept for reference, not used)
 # =============================================================================
 
 class LLMClient:
-    """Client for LLM API with perplexity calculation support.
+    """DEPRECATED: Client for LLM API with perplexity calculation support.
 
-    Supports OpenAI-compatible APIs (vLLM, text-generation-inference, etc.)
-    that can return log probabilities.
+    Note: This class requires vLLM or similar local API with echo=True support.
+    OpenAI API does not support this. Use EmbeddingClient instead.
     """
 
     def __init__(
@@ -105,317 +309,94 @@ class LLMClient:
         api_url: str = "http://localhost:8000/v1/completions",
         model: str = "Qwen/Qwen2.5-7B-Instruct",
         timeout: float = 60.0,
-        api_key: str = "dummy"  # For local APIs
+        api_key: str = "dummy"
     ):
-        """Initialize LLM client.
-
-        Args:
-            api_url: API endpoint URL (OpenAI-compatible)
-            model: Model ID
-            timeout: Request timeout in seconds
-            api_key: API key (use "dummy" for local APIs)
-        """
+        import warnings
+        warnings.warn(
+            "LLMClient is deprecated. Use EmbeddingClient for semantic distance calculation.",
+            DeprecationWarning
+        )
         self.api_url = api_url
         self.model = model
         self.timeout = timeout
         self.api_key = api_key
 
-    def calculate_perplexity(
-        self,
-        text: str,
-        context: Optional[str] = None
-    ) -> float:
-        """Calculate perplexity of text, optionally conditioned on context.
+    def calculate_perplexity(self, text: str, context: Optional[str] = None) -> float:
+        raise NotImplementedError(
+            "Perplexity calculation requires local LLM with echo=True support. "
+            "Use EmbeddingClient.semantic_distance() instead."
+        )
 
-        Args:
-            text: Target text to calculate perplexity for
-            context: Optional context to condition on
+    def calculate_perplexity_batch(self, texts: list[str], contexts: Optional[list[Optional[str]]] = None) -> list[float]:
+        raise NotImplementedError("Use EmbeddingClient instead.")
 
-        Returns:
-            Perplexity value (lower = more predictable)
-        """
-        if not text.strip():
-            return 1.0
-
-        # Build prompt
-        if context:
-            prompt = f"{context}\n\n{text}"
-            # We want PPL of text given context
-            _ = context + "\n\n"  # echo_prompt for future use
-        else:
-            prompt = text
-            _ = ""  # echo_prompt placeholder for future use
-
-        try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.post(
-                    self.api_url,
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "max_tokens": 1,  # We only need logprobs, not generation
-                        "logprobs": True,
-                        "echo": True,  # Return logprobs for input tokens too
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()
-
-                # Extract log probabilities
-                logprobs = result["choices"][0].get("logprobs", {})
-                token_logprobs = logprobs.get("token_logprobs", [])
-
-                if not token_logprobs:
-                    return 1.0
-
-                # Filter out None values (usually the first token)
-                valid_logprobs = [lp for lp in token_logprobs if lp is not None]
-
-                if not valid_logprobs:
-                    return 1.0
-
-                # Calculate perplexity: exp(-mean(log_probs))
-                avg_neg_log_prob = -sum(valid_logprobs) / len(valid_logprobs)
-                perplexity = math.exp(avg_neg_log_prob)
-
-                return perplexity
-
-        except Exception as e:
-            print(f"Warning: Perplexity calculation failed: {e}")
-            return 1.0
-
-    def calculate_perplexity_batch(
-        self,
-        texts: list[str],
-        contexts: Optional[list[Optional[str]]] = None
-    ) -> list[float]:
-        """Calculate perplexity for multiple texts.
-
-        Args:
-            texts: List of target texts
-            contexts: Optional list of contexts (same length as texts)
-
-        Returns:
-            List of perplexity values
-        """
-        if contexts is None:
-            contexts = [None] * len(texts)
-
-        return [
-            self.calculate_perplexity(text, context)
-            for text, context in zip(texts, contexts)
-        ]
-
-
-# =============================================================================
-# Mock LLM Client (for testing without API)
-# =============================================================================
 
 class MockLLMClient:
-    """Mock LLM client for testing without actual API.
-
-    Uses simple heuristics based on text length and overlap.
-    """
+    """DEPRECATED: Mock LLM client. Use MockEmbeddingClient instead."""
 
     def __init__(self):
-        pass
+        import warnings
+        warnings.warn(
+            "MockLLMClient is deprecated. Use MockEmbeddingClient instead.",
+            DeprecationWarning
+        )
 
-    def calculate_perplexity(
-        self,
-        text: str,
-        context: Optional[str] = None
-    ) -> float:
-        """Mock perplexity calculation using text statistics.
-
-        Heuristic:
-        - Base perplexity from vocabulary diversity
-        - Context reduces perplexity if texts share words
-        """
+    def calculate_perplexity(self, text: str, context: Optional[str] = None) -> float:
+        # Simple heuristic for backward compatibility
         if not text.strip():
             return 1.0
-
-        # Simple vocabulary-based heuristic
         words = text.lower().split()
         unique_words = set(words)
         vocab_diversity = len(unique_words) / max(len(words), 1)
-
-        # Base perplexity (higher diversity = higher perplexity)
-        base_ppl = 10 + vocab_diversity * 90  # Range: 10-100
-
+        base_ppl = 10 + vocab_diversity * 90
         if context:
-            # Reduce perplexity based on word overlap
             context_words = set(context.lower().split())
             overlap = len(unique_words & context_words)
             overlap_ratio = overlap / max(len(unique_words), 1)
-
-            # More overlap = lower conditional perplexity
             base_ppl *= (1 - overlap_ratio * 0.5)
-
         return max(base_ppl, 1.0)
 
-    def calculate_perplexity_batch(
-        self,
-        texts: list[str],
-        contexts: Optional[list[Optional[str]]] = None
-    ) -> list[float]:
+    def calculate_perplexity_batch(self, texts: list[str], contexts: Optional[list[Optional[str]]] = None) -> list[float]:
         if contexts is None:
             contexts = [None] * len(texts)
-        return [
-            self.calculate_perplexity(text, context)
-            for text, context in zip(texts, contexts)
-        ]
+        return [self.calculate_perplexity(text, context) for text, context in zip(texts, contexts)]
 
-
-# =============================================================================
-# OpenAI Client for Perplexity Calculation
-# =============================================================================
 
 class OpenAIClient:
-    """OpenAI API client for perplexity calculation using chat completions.
+    """DEPRECATED: OpenAI API cannot provide input token logprobs.
 
-    Uses GPT-4o or other models that support logprobs in chat completions.
+    Use EmbeddingClient for semantic distance calculation instead.
     """
 
-    def __init__(
-        self,
-        model: str = "gpt-4o",
-        api_key: Optional[str] = None,
-        timeout: float = 60.0
-    ):
-        """Initialize OpenAI client.
-
-        Args:
-            model: OpenAI model ID (e.g., "gpt-4o", "gpt-4o-mini")
-            api_key: OpenAI API key (reads from OPENAI_API_KEY env var if not provided)
-            timeout: Request timeout in seconds
-        """
-        import os
-        self.model = model
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.timeout = timeout
-
-        if not self.api_key:
-            raise ValueError(
-                "OpenAI API key required. Set OPENAI_API_KEY environment variable "
-                "or pass api_key parameter."
-            )
-
-    def calculate_perplexity(
-        self,
-        text: str,
-        context: Optional[str] = None
-    ) -> float:
-        """Calculate perplexity using OpenAI chat completions with logprobs.
-
-        Args:
-            text: Target text to calculate perplexity for
-            context: Optional context to condition on
-
-        Returns:
-            Perplexity value (lower = more predictable)
-        """
-        if not text.strip():
-            return 1.0
-
-        # Build messages
-        messages = []
-        if context:
-            messages.append({
-                "role": "system",
-                "content": "You are analyzing text continuity. Given the context, evaluate how the following text continues."
-            })
-            messages.append({
-                "role": "user",
-                "content": f"Context:\n{context}\n\nText to evaluate:\n{text}"
-            })
-        else:
-            messages.append({
-                "role": "user",
-                "content": f"Evaluate this text:\n{text}"
-            })
-
-        try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": messages,
-                        "max_tokens": 1,
-                        "logprobs": True,
-                        "top_logprobs": 5,
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()
-
-                # Extract logprobs from response
-                choices = result.get("choices", [])
-                if not choices:
-                    return 1.0
-
-                logprobs_data = choices[0].get("logprobs", {})
-                content_logprobs = logprobs_data.get("content", [])
-
-                if not content_logprobs:
-                    # Fallback: use simple heuristic based on response
-                    return 10.0  # Default moderate perplexity
-
-                # Calculate perplexity from logprobs
-                total_logprob = sum(
-                    item.get("logprob", 0)
-                    for item in content_logprobs
-                    if item.get("logprob") is not None
-                )
-
-                if len(content_logprobs) > 0:
-                    avg_neg_log_prob = -total_logprob / len(content_logprobs)
-                    perplexity = math.exp(avg_neg_log_prob)
-                else:
-                    perplexity = 1.0
-
-                return perplexity
-
-        except Exception as e:
-            print(f"Warning: OpenAI perplexity calculation failed: {e}")
-            return 1.0
-
-    def calculate_perplexity_batch(
-        self,
-        texts: list[str],
-        contexts: Optional[list[Optional[str]]] = None
-    ) -> list[float]:
-        """Calculate perplexity for multiple texts."""
-        if contexts is None:
-            contexts = [None] * len(texts)
-        return [
-            self.calculate_perplexity(text, context)
-            for text, context in zip(texts, contexts)
-        ]
+    def __init__(self, model: str = "gpt-4o", api_key: Optional[str] = None, timeout: float = 60.0):
+        raise NotImplementedError(
+            "OpenAI Chat API does not support input token logprobs required for perplexity. "
+            "Use EmbeddingClient for semantic distance-based BC/CS calculation."
+        )
 
 
 # =============================================================================
-# BC (Boundary Clarity) Calculation
+# BC (Boundary Clarity) Calculation - Semantic Distance Based
 # =============================================================================
 
 def calculate_bc(
     chunks: Sequence,
-    llm_client: LLMClient | MockLLMClient,
+    embedding_client: EmbeddingClient | MockEmbeddingClient,
     verbose: bool = False
 ) -> BCScore:
-    """Calculate Boundary Clarity for a list of chunks.
+    """Calculate Boundary Clarity for a list of chunks using semantic distance.
 
     BC measures how independent adjacent chunks are.
-    BC(q, d) = ppl(q|d) / ppl(q)
+    BC = 1 - cosine_similarity(chunk_i, chunk_i+1)
+
+    Interpretation:
+    - Higher BC = more independent chunks (good)
+    - BC close to 1.0: chunks are semantically different (independent)
+    - BC close to 0.0: chunks are semantically similar (dependent)
 
     Args:
         chunks: List of Chunk objects or strings
-        llm_client: LLM client for perplexity calculation
+        embedding_client: Embedding client for semantic distance calculation
         verbose: Print progress
 
     Returns:
@@ -438,30 +419,37 @@ def calculate_bc(
 
     pair_scores = []
 
-    for i in range(len(contents) - 1):
-        d = contents[i]      # Current chunk (context)
-        q = contents[i + 1]  # Next chunk (target)
+    # Pre-compute embeddings for efficiency
+    if verbose:
+        print("  Pre-computing embeddings...")
+    embeddings = embedding_client.get_embeddings_batch(contents)
 
+    for i in range(len(contents) - 1):
         if verbose:
             print(f"  BC calculation: chunk {i} → {i+1}", end="", flush=True)
 
-        # Calculate perplexities
-        ppl_q = llm_client.calculate_perplexity(q)
-        ppl_q_given_d = llm_client.calculate_perplexity(q, context=d)
+        # Calculate cosine similarity between adjacent chunks
+        emb_i = embeddings[i]
+        emb_j = embeddings[i + 1]
 
-        # BC = ppl(q|d) / ppl(q)
-        # Higher BC = more independent (good)
-        if ppl_q > 0:
-            bc = ppl_q_given_d / ppl_q
+        norm_i = np.linalg.norm(emb_i)
+        norm_j = np.linalg.norm(emb_j)
+
+        if norm_i == 0 or norm_j == 0:
+            cos_sim = 0.0
         else:
-            bc = 1.0
+            cos_sim = float(np.dot(emb_i, emb_j) / (norm_i * norm_j))
 
-        # Clamp to reasonable range
-        bc = max(0.0, min(bc, 2.0))
+        # BC = semantic distance = 1 - cosine_similarity
+        # Higher BC = more independent (good)
+        bc = 1.0 - cos_sim
+
+        # Clamp to [0, 1] range
+        bc = max(0.0, min(bc, 1.0))
         pair_scores.append(bc)
 
         if verbose:
-            print(f" → BC={bc:.4f} (ppl_q={ppl_q:.2f}, ppl_q|d={ppl_q_given_d:.2f})")
+            print(f" → BC={bc:.4f} (cos_sim={cos_sim:.4f})")
 
     if not pair_scores:
         return BCScore(
@@ -473,7 +461,6 @@ def calculate_bc(
             pair_count=0,
         )
 
-    import numpy as np
     return BCScore(
         score=float(np.mean(pair_scores)),
         pair_scores=pair_scores,
@@ -485,53 +472,54 @@ def calculate_bc(
 
 
 # =============================================================================
-# CS (Chunk Stickiness) Calculation
+# CS (Chunk Stickiness) Calculation - Semantic Distance Based
 # =============================================================================
 
-def calculate_edge_weight(
-    q: str,
-    d: str,
-    llm_client: LLMClient | MockLLMClient
+def calculate_edge_weight_semantic(
+    emb_i: np.ndarray,
+    emb_j: np.ndarray
 ) -> float:
-    """Calculate edge weight between two chunks.
+    """Calculate edge weight between two chunks using cosine similarity.
 
-    Edge(q, d) = (ppl(q) - ppl(q|d)) / ppl(q)
-    - Close to 1: high correlation (d helps predict q)
-    - Close to 0: independent
+    Edge weight = cosine_similarity(chunk_i, chunk_j)
+    - Close to 1: high semantic similarity (chunks are related)
+    - Close to 0: low similarity (independent)
 
     Args:
-        q: Target chunk
-        d: Context chunk
-        llm_client: LLM client
+        emb_i: Embedding of first chunk
+        emb_j: Embedding of second chunk
 
     Returns:
         Edge weight [0, 1]
     """
-    ppl_q = llm_client.calculate_perplexity(q)
-    ppl_q_given_d = llm_client.calculate_perplexity(q, context=d)
+    norm_i = np.linalg.norm(emb_i)
+    norm_j = np.linalg.norm(emb_j)
 
-    if ppl_q <= 0:
+    if norm_i == 0 or norm_j == 0:
         return 0.0
 
-    weight = (ppl_q - ppl_q_given_d) / ppl_q
-    return max(0.0, min(1.0, weight))
+    cos_sim = float(np.dot(emb_i, emb_j) / (norm_i * norm_j))
+    # Clamp to [0, 1] - negative similarities treated as 0
+    return max(0.0, min(1.0, cos_sim))
 
 
 def build_chunk_graph(
     chunks: Sequence,
-    llm_client: LLMClient | MockLLMClient,
+    embedding_client: EmbeddingClient | MockEmbeddingClient,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
-    verbose: bool = False
+    verbose: bool = False,
+    embeddings: Optional[np.ndarray] = None
 ) -> dict[int, list[tuple[int, float]]]:
-    """Build a weighted graph from chunks based on edge weights.
+    """Build a weighted graph from chunks based on semantic similarity.
 
     Args:
         chunks: List of chunks
-        llm_client: LLM client for perplexity
+        embedding_client: Embedding client for similarity calculation
         threshold_k: Only keep edges with weight >= threshold_k
         graph_type: "complete" (all pairs) or "incomplete" (sequential only)
         verbose: Print progress
+        embeddings: Pre-computed embeddings (optional)
 
     Returns:
         Adjacency list: {node_id: [(neighbor_id, weight), ...]}
@@ -544,6 +532,12 @@ def build_chunk_graph(
 
     if n == 0:
         return {}
+
+    # Get embeddings if not provided
+    if embeddings is None:
+        if verbose:
+            print("  Computing embeddings...")
+        embeddings = embedding_client.get_embeddings_batch(contents)
 
     # Initialize adjacency list
     graph: dict[int, list[tuple[int, float]]] = {i: [] for i in range(n)}
@@ -559,12 +553,8 @@ def build_chunk_graph(
                 if verbose:
                     print(f"  Edge {current}/{total_pairs}: {i} ↔ {j}", end="", flush=True)
 
-                # Calculate bidirectional weights
-                w_ij = calculate_edge_weight(contents[j], contents[i], llm_client)
-                w_ji = calculate_edge_weight(contents[i], contents[j], llm_client)
-
-                # Use max weight for undirected graph
-                weight = max(w_ij, w_ji)
+                # Calculate cosine similarity as edge weight
+                weight = calculate_edge_weight_semantic(embeddings[i], embeddings[j])
 
                 if verbose:
                     print(f" → w={weight:.4f}")
@@ -574,13 +564,13 @@ def build_chunk_graph(
                     graph[j].append((i, weight))
 
     elif graph_type == "incomplete":
-        # Incomplete graph: only sequential pairs (j - i > 0)
+        # Incomplete graph: only sequential pairs
         for i in range(n - 1):
             j = i + 1
             if verbose:
                 print(f"  Edge: {i} → {j}", end="", flush=True)
 
-            weight = calculate_edge_weight(contents[j], contents[i], llm_client)
+            weight = calculate_edge_weight_semantic(embeddings[i], embeddings[j])
 
             if verbose:
                 print(f" → w={weight:.4f}")
@@ -634,19 +624,21 @@ def calculate_structural_entropy(graph: dict[int, list[tuple[int, float]]]) -> f
 
 def calculate_cs(
     chunks: Sequence,
-    llm_client: LLMClient | MockLLMClient,
+    embedding_client: EmbeddingClient | MockEmbeddingClient,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
-    verbose: bool = False
+    verbose: bool = False,
+    embeddings: Optional[np.ndarray] = None
 ) -> CSScore:
-    """Calculate Chunk Stickiness using Structural Entropy.
+    """Calculate Chunk Stickiness using Structural Entropy with semantic similarity.
 
     Args:
         chunks: List of chunks
-        llm_client: LLM client for perplexity
-        threshold_k: Edge filtering threshold
+        embedding_client: Embedding client for similarity calculation
+        threshold_k: Edge filtering threshold (keep edges with similarity >= threshold)
         graph_type: "complete" or "incomplete"
         verbose: Print progress
+        embeddings: Pre-computed embeddings (optional)
 
     Returns:
         CSScore with structural entropy
@@ -665,12 +657,18 @@ def calculate_cs(
             threshold_k=threshold_k,
         )
 
+    # Get embeddings if not provided
+    if embeddings is None:
+        if verbose:
+            print("  Computing embeddings...")
+        embeddings = embedding_client.get_embeddings_batch(contents)
+
     # Build graph
     if verbose:
         print(f"  Building {graph_type} graph (threshold={threshold_k})...")
 
     graph = build_chunk_graph(
-        chunks, llm_client, threshold_k, graph_type, verbose
+        chunks, embedding_client, threshold_k, graph_type, verbose, embeddings
     )
 
     # Count edges (divide by 2 for undirected)
@@ -694,47 +692,59 @@ def calculate_cs(
 
 def evaluate_chunking(
     chunks: Sequence,
-    llm_client: LLMClient | MockLLMClient | None = None,
+    embedding_client: EmbeddingClient | MockEmbeddingClient | None = None,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     calculate_cs_flag: bool = True,
     verbose: bool = False
 ) -> ChunkingMetrics:
-    """Evaluate chunking quality using BC and CS metrics.
+    """Evaluate chunking quality using BC and CS metrics with semantic distance.
 
     Args:
         chunks: List of chunks
-        llm_client: LLM client (uses MockLLMClient if None)
-        threshold_k: CS edge filtering threshold
-        graph_type: CS graph type
-        calculate_cs_flag: Whether to calculate CS (can be slow)
+        embedding_client: Embedding client (uses MockEmbeddingClient if None)
+        threshold_k: CS edge filtering threshold (similarity >= threshold)
+        graph_type: CS graph type ("complete" or "incomplete")
+        calculate_cs_flag: Whether to calculate CS (can be slow for complete graph)
         verbose: Print progress
 
     Returns:
         ChunkingMetrics with BC and CS scores
     """
-    if llm_client is None:
-        print("Warning: No LLM client provided, using MockLLMClient")
-        llm_client = MockLLMClient()
+    if embedding_client is None:
+        print("Warning: No embedding client provided, using MockEmbeddingClient")
+        embedding_client = MockEmbeddingClient()
+
+    # Pre-compute embeddings for efficiency
+    contents = [
+        c.content if hasattr(c, 'content') else str(c)
+        for c in chunks
+    ]
+
+    if verbose:
+        print("Pre-computing embeddings for all chunks...")
+    embeddings = embedding_client.get_embeddings_batch(contents)
 
     # Calculate BC
     if verbose:
         print("Calculating BC (Boundary Clarity)...")
-    bc_score = calculate_bc(chunks, llm_client, verbose)
+    bc_score = calculate_bc(chunks, embedding_client, verbose)
 
     # Calculate CS
     cs_score = None
     if calculate_cs_flag:
         if verbose:
             print("Calculating CS (Chunk Stickiness)...")
-        cs_score = calculate_cs(chunks, llm_client, threshold_k, graph_type, verbose)
+        cs_score = calculate_cs(
+            chunks, embedding_client, threshold_k, graph_type, verbose, embeddings
+        )
 
     return ChunkingMetrics(bc_score=bc_score, cs_score=cs_score)
 
 
 def compare_chunking_quality(
     results: dict[str, Sequence],
-    llm_client: LLMClient | MockLLMClient | None = None,
+    embedding_client: EmbeddingClient | MockEmbeddingClient | None = None,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     verbose: bool = False
@@ -743,7 +753,7 @@ def compare_chunking_quality(
 
     Args:
         results: {parser_name: chunks} dictionary
-        llm_client: LLM client
+        embedding_client: Embedding client for similarity calculation
         threshold_k: CS threshold
         graph_type: CS graph type
         verbose: Print progress
@@ -758,7 +768,7 @@ def compare_chunking_quality(
             print(f"\n=== Evaluating: {parser_name} ===")
 
         metrics = evaluate_chunking(
-            chunks, llm_client, threshold_k, graph_type,
+            chunks, embedding_client, threshold_k, graph_type,
             calculate_cs_flag=True, verbose=verbose
         )
 
@@ -768,3 +778,25 @@ def compare_chunking_quality(
         }
 
     return comparison
+
+
+# =============================================================================
+# Convenience Functions
+# =============================================================================
+
+def create_embedding_client(
+    model: str = "jhgan/ko-sroberta-multitask",
+    use_mock: bool = False
+) -> EmbeddingClient | MockEmbeddingClient:
+    """Factory function to create embedding client.
+
+    Args:
+        model: Sentence transformer model name
+        use_mock: Use mock client (no actual embeddings)
+
+    Returns:
+        EmbeddingClient or MockEmbeddingClient instance
+    """
+    if use_mock:
+        return MockEmbeddingClient()
+    return EmbeddingClient(model=model)
