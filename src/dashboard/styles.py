@@ -15,9 +15,10 @@ COLORS = {
     "bg_card": "#FFFFFF",
 
     # Parser colors (Vibrant & Distinct)
-    "vlm_color": "#2E8B57",       # Sea Green - VLM
-    "ocr_color": "#4169E1",       # Royal Blue - OCR
-    "docling_color": "#FF8C00",   # Dark Orange - Docling
+    # Note: These are legacy colors, use PARSER_COLORS dict for consistency
+    "vlm_color": "#4F46E5",       # Indigo - VLM
+    "ocr_color": "#059669",       # Emerald - OCR-Text
+    "ocr_image_color": "#D97706", # Amber - OCR-Image
 
     # Chart colors (Multiple for scatter plots)
     "chart_colors": [
@@ -52,18 +53,34 @@ COLORS = {
 }
 
 
-# Parser name to color mapping
+# TwoStage parser colors (added to COLORS dict for backward compatibility)
+COLORS["twostage_text_color"] = "#7C3AED"   # Purple - TwoStage-Text
+COLORS["twostage_image_color"] = "#0891B2"  # Cyan - TwoStage-Image
+COLORS["ocr_image_color"] = "#D97706"       # Amber - OCR-Image (alias)
+
+# Parser name to color mapping (Single Source of Truth)
+# VLM: Indigo, OCR/Text-Baseline: Emerald, OCR-Image: Amber, TwoStage/Advanced: Purple/Cyan
 PARSER_COLORS = {
-    "vlm": COLORS["vlm_color"],
-    "VLM": COLORS["vlm_color"],
-    "ocr": COLORS["ocr_color"],
-    "OCR": COLORS["ocr_color"],
-    "OCR-Text": COLORS["ocr_color"],
-    "ocr-text": COLORS["ocr_color"],
-    "docling": COLORS["docling_color"],
-    "Docling": COLORS["docling_color"],
-    "OCR-Image": COLORS["docling_color"],
-    "ocr-image": COLORS["docling_color"],
+    # VLM parser
+    "vlm": "#4F46E5",
+    "VLM": "#4F46E5",
+    # Text-Baseline / OCR-Text parser (Emerald)
+    "ocr": "#059669",
+    "OCR": "#059669",
+    "OCR-Text": "#059669",
+    "ocr-text": "#059669",
+    "Text-Baseline": "#059669",
+    "text-baseline": "#059669",
+    # OCR-Image parser (Amber)
+    "OCR-Image": "#D97706",
+    "ocr-image": "#D97706",
+    # Text-Advanced / TwoStage parsers (Purple/Cyan)
+    "Text-Advanced": "#7C3AED",
+    "text-advanced": "#7C3AED",
+    "TwoStage-Text": "#7C3AED",
+    "twostage-text": "#7C3AED",
+    "TwoStage-Image": "#0891B2",
+    "twostage-image": "#0891B2",
 }
 
 
@@ -332,7 +349,7 @@ def apply_dark_theme() -> str:
             color: #1E40AF;
         }
 
-        .parser-docling {
+        .parser-ocr-image {
             background-color: #FEF3C7;
             color: #92400E;
         }

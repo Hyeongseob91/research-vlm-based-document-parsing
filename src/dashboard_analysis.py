@@ -48,11 +48,12 @@ from dashboard.data_loader import (
     get_chunking_data_for_parser,
 )
 from dashboard.charts import (
-    STRATEGY_COLORS as CHART_STRATEGY_COLORS,
+    STRATEGY_COLORS,
     create_parser_chunking_comparison,
     create_bc_document_flow,
     create_cs_mean_std_bar,
 )
+from dashboard.styles import PARSER_COLORS as STYLE_PARSER_COLORS
 
 # =============================================================================
 # 페이지 설정
@@ -128,23 +129,25 @@ st.markdown("""
 VERSION = "v0.4.0"  # Added parser-specific chunking analysis (MoC-based)
 PAGE_SIZE = 10  # 페이지네이션 크기
 
-# 동적 색상 생성 (파서 추가 시 자동 확장)
-DEFAULT_COLORS = ["#4F46E5", "#059669", "#D97706", "#DC2626", "#7C3AED", "#0891B2"]
+# 동적 색상 생성용 기본 팔레트 (파서 추가 시 자동 확장)
+DEFAULT_COLORS = [
+    "#4F46E5",  # VLM - 인디고
+    "#059669",  # OCR-Text - 에메랄드
+    "#D97706",  # OCR-Image - 앰버
+    "#7C3AED",  # TwoStage-Text - 보라
+    "#0891B2",  # TwoStage-Image - 청록
+    "#DC2626",  # 여유 - 레드
+    "#EC4899",  # 여유 - 핑크
+]
+
 
 def get_parser_colors(parsers: List[str]) -> Dict[str, str]:
-    """파서별 색상 동적 생성"""
+    """파서별 색상 동적 생성 (styles.py의 PARSER_COLORS를 단일 진실 공급원으로 사용)"""
     colors = {}
     for i, parser in enumerate(parsers):
-        colors[parser] = DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
+        # styles.py에서 정의된 색상 사용, 없으면 순환 색상
+        colors[parser] = STYLE_PARSER_COLORS.get(parser, DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
     return colors
-
-# 청킹 전략 색상
-STRATEGY_COLORS = {
-    "Fixed": "#6366F1",
-    "Sentence": "#10B981",
-    "Semantic": "#F59E0B",
-    "Structuring": "#8B5CF6",
-}
 
 
 # =============================================================================
@@ -200,7 +203,7 @@ def create_thin_bar_chart(data: Dict, metric: str, title: str,
     if metric == "elapsed_time":
         text_values = [f"{v:.1f}s" for v in values]
     elif metric == "content_length":
-        text_values = [f"{int(v):,}" for v in values]
+        text_values = ["데이터없음" if v == 0 else f"{int(v):,}" for v in values]
     else:
         text_values = [f"{v:.3f}" for v in values]
 
@@ -574,12 +577,18 @@ with tab_parsing:
             # 테이블
             detail_rows = []
             for parser, metrics in test_data["parsers"].items():
+                content_length = metrics.get('content_length')
+                if content_length is None or content_length == 0:
+                    content_display = "데이터없음"
+                else:
+                    content_display = f"{int(content_length):,}"
+
                 detail_rows.append({
                     "Parser": parser,
                     "WER ↓": f"{metrics.get('wer') or 0:.3f}",
                     "CER ↓": f"{metrics.get('cer') or 0:.3f}",
                     "Latency ↓": f"{metrics.get('elapsed_time') or 0:.1f}s",
-                    "Content": f"{int(metrics.get('content_length') or 0):,}",
+                    "Content": content_display,
                 })
             st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
 
@@ -880,44 +889,45 @@ with tab_chunking:
         with col_bc:
             st.markdown("""
             ### Boundary Clarity (BC)
-            **청크 경계의 의미적 명확성** · :green[↑ 높을수록 좋음]
+            **인접 청크 간 의미적 독립성** · :green[↑ 높을수록 좋음]
 
             ```
-            BC = ppl(q|d) / ppl(q)
+            BC = 1 - cosine_similarity(chunk_i, chunk_i+1)
 
-            ppl(q|d): 이전 청크를 컨텍스트로 한 Perplexity
-            ppl(q):   독립적인 Perplexity
+            인접 청크 간 임베딩 거리 (Semantic Distance)
             ```
 
-            - **BC > 0.8**: 우수한 경계 품질
+            - **BC > 0.5**: 우수한 경계 품질
             - **BC ≈ 1.0**: 이상적 (청크가 의미적으로 독립)
-            - **BC < 0.5**: 청크 경계 재검토 필요
+            - **BC < 0.3**: 청크 경계 재검토 필요
             """)
 
         with col_cs:
             st.markdown("""
             ### Chunk Stickiness (CS)
-            **청크 내부 응집도** · :orange[↓ 낮을수록 좋음]
+            **청크 그래프의 구조적 엔트로피** · :orange[↓ 낮을수록 좋음]
 
             ```
-            CS = avg(similarity(sent_i, sent_j))
+            CS = -Σ (h_i / 2m) × log₂(h_i / 2m)
 
-            청크 내 모든 문장 쌍의 평균 유사도
+            h_i: 노드 i의 가중 차수
+            m: 전체 엣지 가중치 합 / 2
             ```
 
-            - **CS < 0.3**: 청크 내부가 독립적 (좋음)
-            - **CS > 0.5**: 과도한 응집 (분할 필요)
-            - **N/A**: Structuring 전략은 구조 기반 분할
+            - **CS < 1.0**: 청크가 독립적 (좋음)
+            - **CS > 2.0**: 과도한 연결성 (분할 필요)
+            - 임베딩 코사인 유사도 기반 그래프 구축
             """)
 
         st.markdown("---")
         st.markdown("""
         | 지표 | 의미 | 이상적 값 | 해석 |
         |------|------|----------|------|
-        | **BC ↑** | Boundary Clarity | > 0.8 | 청크 경계가 의미 단위와 일치 |
-        | **CS ↓** | Chunk Stickiness | < 0.3 | 청크 내부 문장들이 독립적 |
-        | **std_bc ↓** | BC 표준편차 | < 0.1 | 일관된 경계 품질 |
-        | **std_cs ↓** | CS 표준편차 | < 0.1 | 일관된 응집도 |
+        | **BC ↑** | Boundary Clarity | > 0.5 | 인접 청크가 의미적으로 독립적 |
+        | **CS ↓** | Chunk Stickiness | < 1.0 | 청크 그래프가 희소함 (독립적) |
+        | **std_bc ↓** | BC 표준편차 | < 0.15 | 일관된 경계 품질 |
+
+        *BC는 Semantic Distance 기반 (1 - cosine similarity), CS는 Structural Entropy 기반*
         """)
 
     # =========================================================================
