@@ -22,8 +22,11 @@ Advantages over traditional metrics:
 import math
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union, TYPE_CHECKING
 from collections.abc import Sequence
+
+# Type alias for embedding clients (defined after classes are created)
+# EmbeddingClientType will be defined at module level after class definitions
 
 
 # =============================================================================
@@ -239,6 +242,162 @@ class EmbeddingClient:
         self._cache = {}
 
 
+class APIEmbeddingClient:
+    """Embedding client using external API (Infinity/OpenAI compatible).
+
+    Connects to embedding services like Infinity serving BGE-M3 or other models.
+    Uses OpenAI-compatible /embeddings endpoint.
+    """
+
+    def __init__(
+        self,
+        api_url: str = "http://localhost:8001/embeddings",
+        model: str = "BAAI/bge-m3",
+        timeout: float = 60.0,
+        batch_size: int = 32,
+        cache_embeddings: bool = True
+    ):
+        """Initialize API embedding client.
+
+        Args:
+            api_url: Embedding API endpoint URL
+            model: Model name to use
+            timeout: Request timeout in seconds
+            batch_size: Max texts per batch request
+            cache_embeddings: Whether to cache embeddings for repeated texts
+        """
+        self.api_url = api_url
+        self.model = model
+        self.timeout = timeout
+        self.batch_size = batch_size
+        self.cache_embeddings = cache_embeddings
+        self._cache: dict[str, np.ndarray] = {}
+        self._embedding_dim: Optional[int] = None
+
+    def _request_embeddings(self, texts: list[str]) -> list[np.ndarray]:
+        """Make API request for embeddings.
+
+        Args:
+            texts: List of texts to embed
+
+        Returns:
+            List of embedding arrays
+        """
+        import httpx
+
+        response = httpx.post(
+            self.api_url,
+            json={"model": self.model, "input": texts},
+            timeout=self.timeout
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        embeddings = []
+
+        # Sort by index to maintain order
+        sorted_data = sorted(data["data"], key=lambda x: x["index"])
+        for item in sorted_data:
+            emb = np.array(item["embedding"], dtype=np.float32)
+            embeddings.append(emb)
+
+        # Store embedding dimension
+        if embeddings and self._embedding_dim is None:
+            self._embedding_dim = len(embeddings[0])
+
+        return embeddings
+
+    def get_embedding(self, text: str) -> np.ndarray:
+        """Get embedding for a text.
+
+        Args:
+            text: Text to embed
+
+        Returns:
+            Embedding vector as numpy array
+        """
+        if not text.strip():
+            dim = self._embedding_dim or 1024  # BGE-M3 default
+            return np.zeros(dim)
+
+        # Check cache
+        if self.cache_embeddings and text in self._cache:
+            return self._cache[text]
+
+        embeddings = self._request_embeddings([text])
+        embedding = embeddings[0]
+
+        # Cache result
+        if self.cache_embeddings:
+            self._cache[text] = embedding
+
+        return embedding
+
+    def get_embeddings_batch(self, texts: list[str]) -> np.ndarray:
+        """Get embeddings for multiple texts.
+
+        Args:
+            texts: List of texts to embed
+
+        Returns:
+            Array of embeddings (n_texts, embedding_dim)
+        """
+        if not texts:
+            return np.array([])
+
+        # Check which texts need embedding
+        uncached_indices = []
+        uncached_texts = []
+        results: list[Optional[np.ndarray]] = [None] * len(texts)
+
+        for i, text in enumerate(texts):
+            if not text.strip():
+                dim = self._embedding_dim or 1024
+                results[i] = np.zeros(dim)
+            elif self.cache_embeddings and text in self._cache:
+                results[i] = self._cache[text]
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(text)
+
+        # Request embeddings in batches
+        if uncached_texts:
+            all_new_embeddings = []
+            for batch_start in range(0, len(uncached_texts), self.batch_size):
+                batch_texts = uncached_texts[batch_start:batch_start + self.batch_size]
+                batch_embeddings = self._request_embeddings(batch_texts)
+                all_new_embeddings.extend(batch_embeddings)
+
+            # Assign to results and cache
+            for idx, text, emb in zip(uncached_indices, uncached_texts, all_new_embeddings):
+                results[idx] = emb
+                if self.cache_embeddings:
+                    self._cache[text] = emb
+
+        return np.array(results)
+
+    def cosine_similarity(self, text1: str, text2: str) -> float:
+        """Calculate cosine similarity between two texts."""
+        emb1 = self.get_embedding(text1)
+        emb2 = self.get_embedding(text2)
+
+        norm1 = np.linalg.norm(emb1)
+        norm2 = np.linalg.norm(emb2)
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        return float(np.dot(emb1, emb2) / (norm1 * norm2))
+
+    def semantic_distance(self, text1: str, text2: str) -> float:
+        """Calculate semantic distance between two texts."""
+        return 1.0 - self.cosine_similarity(text1, text2)
+
+    def clear_cache(self):
+        """Clear the embedding cache."""
+        self._cache = {}
+
+
 class MockEmbeddingClient:
     """Mock embedding client for testing without actual model.
 
@@ -291,6 +450,10 @@ class MockEmbeddingClient:
     def clear_cache(self):
         """No-op for mock client."""
         pass
+
+
+# Type alias for any embedding client
+EmbeddingClientType = Union[EmbeddingClient, APIEmbeddingClient, MockEmbeddingClient]
 
 
 # =============================================================================
@@ -381,7 +544,7 @@ class OpenAIClient:
 
 def calculate_bc(
     chunks: Sequence,
-    embedding_client: EmbeddingClient | MockEmbeddingClient,
+    embedding_client: EmbeddingClientType,
     verbose: bool = False
 ) -> BCScore:
     """Calculate Boundary Clarity for a list of chunks using semantic distance.
@@ -505,7 +668,7 @@ def calculate_edge_weight_semantic(
 
 def build_chunk_graph(
     chunks: Sequence,
-    embedding_client: EmbeddingClient | MockEmbeddingClient,
+    embedding_client: EmbeddingClientType,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     verbose: bool = False,
@@ -624,7 +787,7 @@ def calculate_structural_entropy(graph: dict[int, list[tuple[int, float]]]) -> f
 
 def calculate_cs(
     chunks: Sequence,
-    embedding_client: EmbeddingClient | MockEmbeddingClient,
+    embedding_client: EmbeddingClientType,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     verbose: bool = False,
@@ -692,7 +855,7 @@ def calculate_cs(
 
 def evaluate_chunking(
     chunks: Sequence,
-    embedding_client: EmbeddingClient | MockEmbeddingClient | None = None,
+    embedding_client: EmbeddingClientType | None = None,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     calculate_cs_flag: bool = True,
@@ -744,7 +907,7 @@ def evaluate_chunking(
 
 def compare_chunking_quality(
     results: dict[str, Sequence],
-    embedding_client: EmbeddingClient | MockEmbeddingClient | None = None,
+    embedding_client: EmbeddingClientType | None = None,
     threshold_k: float = 0.8,
     graph_type: str = "incomplete",
     verbose: bool = False
@@ -786,17 +949,34 @@ def compare_chunking_quality(
 
 def create_embedding_client(
     model: str = "jhgan/ko-sroberta-multitask",
-    use_mock: bool = False
-) -> EmbeddingClient | MockEmbeddingClient:
+    use_mock: bool = False,
+    api_url: Optional[str] = None,
+) -> EmbeddingClientType:
     """Factory function to create embedding client.
 
     Args:
-        model: Sentence transformer model name
+        model: Model name (sentence transformer or API model)
         use_mock: Use mock client (no actual embeddings)
+        api_url: If provided, use API-based embedding client (e.g., Infinity)
 
     Returns:
-        EmbeddingClient or MockEmbeddingClient instance
+        EmbeddingClient, APIEmbeddingClient, or MockEmbeddingClient instance
+
+    Examples:
+        # Local sentence-transformers model
+        client = create_embedding_client(model="jhgan/ko-sroberta-multitask")
+
+        # API-based (Infinity with BGE-M3)
+        client = create_embedding_client(
+            api_url="http://localhost:8001/embeddings",
+            model="BAAI/bge-m3"
+        )
+
+        # Mock for testing
+        client = create_embedding_client(use_mock=True)
     """
     if use_mock:
         return MockEmbeddingClient()
+    if api_url:
+        return APIEmbeddingClient(api_url=api_url, model=model)
     return EmbeddingClient(model=model)
