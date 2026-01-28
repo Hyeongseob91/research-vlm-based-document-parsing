@@ -1,3 +1,14 @@
+<div align="center">
+
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](pyproject.toml)
+
+<a href="README.md"><img src="https://img.shields.io/badge/English-gray?style=for-the-badge" alt="English"></a>
+<a href="README.ko.md"><img src="https://img.shields.io/badge/한국어-blue?style=for-the-badge" alt="Korean"></a>
+
+</div>
+
 # 문서 파싱 구조 보존 테스트 프레임워크
 
 > **"파싱 단계에서 손실된 구조는 영원히 손실된다 — 어떤 downstream 최적화도 이를 복원할 수 없다."**
