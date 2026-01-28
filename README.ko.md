@@ -73,6 +73,24 @@ python -m src.eval_chunking --all
 | **RQ2** | VLM 기반 파싱이 구조를 보존할 수 있는가? | BC (Boundary Clarity), CS (Chunk Stickiness) |
 | **RQ3** | 파싱 단계의 구조 보존이 downstream(청킹, 검색) 품질을 결정하는가? | Hit Rate@k, MRR |
 
+### 핵심 결과
+
+<div align="center">
+
+<img src="docs/tech_report/figures/fig1_structure_f1_comparison.png" width="600" alt="Structure F1 비교: Baseline (0%) vs Advanced (~79%)">
+
+**Fig 1.** Baseline 파서는 문서 구조를 0% 보존하는 반면, VLM 기반 Advanced 파서는 ~79% Structure F1을 달성합니다.
+
+<br>
+
+<img src="docs/tech_report/figures/fig3_tradeoff_scatter.png" width="600" alt="Trade-off: CER vs Structure F1">
+
+**Fig 2.** Advanced 파서는 어휘 정확도(높은 CER)를 구조 보존(높은 F1)과 교환합니다 — RAG 파이프라인에서는 가치 있는 트레이드오프입니다.
+
+</div>
+
+> 전체 실험 결과 및 분석은 [Tech Report](docs/tech_report/)를 참고하세요.
+
 ---
 
 ## 주요 기능
