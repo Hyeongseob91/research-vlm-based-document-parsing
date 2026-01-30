@@ -55,7 +55,76 @@
 - Figure/table separation
 - Reference accuracy
 
-### 4.1.3 Ground Truth Creation
+### 4.1.3 arXiv Extended Dataset (test_arxiv_001–039)
+
+To address the limited sample size of 3 manually-curated test documents, we constructed an extended dataset of 39 academic papers from arXiv with automatically generated ground truth.
+
+#### Selection Criteria
+
+Papers were selected according to the following objective criteria:
+
+| Criterion | Specification |
+|-----------|---------------|
+| **Source** | arXiv preprint repository (arxiv.org) |
+| **Domain** | cs.CL, cs.CV, cs.LG (Computational Linguistics, Computer Vision, Machine Learning) |
+| **Time Range** | 2013–2023 (11 years, ensuring temporal diversity) |
+| **Language** | English only (Korean coverage by test_1; multilingual by OmniDocBench) |
+| **Source Requirement** | LaTeX source (.tex) must be publicly available via arXiv e-print |
+| **Sample Size** | n ≥ 30, per Central Limit Theorem for valid parametric statistics |
+
+#### Structural Diversity Requirements
+
+To evaluate diverse document structures, candidates were categorized into four types:
+
+| Category | Definition | Target % | Actual (n) |
+|----------|-----------|----------|------------|
+| **table-heavy** | ≥ 3 result comparison or benchmark tables | 40% | 16 (41%) |
+| **equation-heavy** | ≥ 5 display equations or mathematical derivations | 30% | 12 (31%) |
+| **mixed** | Tables + equations + figure captions without single dominant element | 25% | 10 (26%) |
+| **code-block** | Algorithm pseudocode or listing environments | 5% | 1 (3%) |
+
+#### Exclusion Criteria
+
+Papers were excluded if any of the following applied:
+
+1. No LaTeX source available on arXiv (PDF-only uploads)
+2. LaTeX source fails pandoc conversion after preprocessing (custom macros, conditional blocks)
+3. Converted GT markdown contains < 500 characters
+4. Excessive custom macros causing > 50% content loss in conversion
+
+#### Year Distribution
+
+| Year | 2013 | 2014 | 2015 | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 | 2022 | 2023 |
+|------|------|------|------|------|------|------|------|------|------|------|------|
+| Papers | 1 | 3 | 6 | 2 | 6 | 4 | 2 | 4 | 3 | 4 | 4 |
+
+#### Build Pipeline
+
+50 candidate papers were selected; 39 passed conversion (78% success rate):
+
+```
+arXiv LaTeX source (.tex)
+  → \input{} recursive merge + .bbl bibliography merge
+  → Strip LaTeX conditionals (\if..\fi) and custom \newcommand definitions
+  → pandoc -f latex -t markdown --wrap=none --markdown-headings=atx
+  → Post-processing: equation normalization, table formatting, artifact removal
+  → GT quality validation (structural checks + CER vs PyMuPDF extraction)
+  → data/test_arxiv_NNN/gt_paper.md
+```
+
+Each test folder contains:
+- `paper.pdf` — original arXiv PDF
+- `gt_paper.md` — auto-generated ground truth markdown
+- `metadata.json` — arXiv ID, title, category, expected structures
+
+#### Limitations
+
+- **GT quality**: Auto-generated from LaTeX, not manually verified. Complex tables (multirow/multicolumn) may not convert correctly to markdown pipe tables.
+- **Language**: English only. Korean evaluation relies on test_1.
+- **Figure content**: Figures are excluded from GT (only captions retained); evaluation focuses on text and structural elements.
+- **Conversion bias**: Papers with simpler LaTeX have higher conversion success rates, potentially skewing the dataset toward less complex documents.
+
+### 4.1.4 Ground Truth Creation
 
 Ground truth files were manually created following these guidelines:
 
