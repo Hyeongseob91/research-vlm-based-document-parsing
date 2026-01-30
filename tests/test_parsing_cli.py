@@ -16,6 +16,11 @@ from src.eval_parsers import (
     calculate_wer,
     evaluate_results,
     scan_data_folders,
+    extract_markdown_tables,
+    markdown_table_to_html,
+    compute_teds,
+    calculate_teds,
+    html_to_tree,
 )
 
 
@@ -318,3 +323,147 @@ class TestEdgeCases:
         hypothesis = "Hello 안녕 World 세계"
         result = calculate_wer(reference, hypothesis)
         assert result["wer"] == 0.0
+
+
+# =============================================================================
+# TEDS (Tree Edit Distance Similarity) Tests
+# =============================================================================
+
+class TestExtractMarkdownTables:
+    """마크다운 테이블 추출 테스트"""
+
+    def test_extract_single_table(self):
+        """단일 테이블 추출"""
+        md = "Some text\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nMore text"
+        tables = extract_markdown_tables(md)
+        assert len(tables) == 1
+        assert "| A | B |" in tables[0]
+
+    def test_extract_multiple_tables(self):
+        """복수 테이블 추출"""
+        md = "| A | B |\n|---|---|\n| 1 | 2 |\n\nText\n\n| C | D |\n|---|---|\n| 3 | 4 |"
+        tables = extract_markdown_tables(md)
+        assert len(tables) == 2
+
+    def test_no_tables(self):
+        """테이블 없는 텍스트"""
+        md = "Just some text\nwith no tables"
+        tables = extract_markdown_tables(md)
+        assert len(tables) == 0
+
+    def test_separator_row_included(self):
+        """구분선 행도 테이블 블록에 포함"""
+        md = "| H1 | H2 |\n|---|---|\n| a | b |"
+        tables = extract_markdown_tables(md)
+        assert len(tables) == 1
+        assert "|---|---|" in tables[0]
+
+
+class TestMarkdownTableToHtml:
+    """마크다운 → HTML 테이블 변환 테스트"""
+
+    def test_basic_conversion(self):
+        """기본 변환"""
+        md = "| A | B |\n|---|---|\n| 1 | 2 |"
+        html = markdown_table_to_html(md)
+        assert "<table>" in html or "<table" in html
+        assert "<td>" in html or "<td " in html
+
+    def test_header_row(self):
+        """헤더 행이 <th>로 변환"""
+        md = "| Name | Age |\n|------|-----|\n| Alice | 30 |"
+        html = markdown_table_to_html(md)
+        assert "<th>" in html or "<th " in html
+
+
+class TestHtmlToTree:
+    """HTML → 트리 변환 테스트"""
+
+    def test_basic_tree(self):
+        """기본 트리 생성"""
+        html = "<table><tr><td>A</td><td>B</td></tr></table>"
+        tree = html_to_tree(html)
+        assert tree is not None
+        assert tree.tag == "table"
+        assert len(tree.children) == 1  # 1 tr
+        assert len(tree.children[0].children) == 2  # 2 td
+
+    def test_empty_html(self):
+        """빈 HTML"""
+        tree = html_to_tree("")
+        assert tree is None
+
+    def test_cell_text(self):
+        """셀 텍스트 추출"""
+        html = "<table><tr><td>Hello</td></tr></table>"
+        tree = html_to_tree(html)
+        assert tree.children[0].children[0].text == "Hello"
+
+
+class TestComputeTeds:
+    """TEDS 계산 테스트"""
+
+    def test_identical_tables(self):
+        """동일 테이블 TEDS = 1.0"""
+        html = "<table><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>"
+        score = compute_teds(html, html)
+        assert score == 1.0
+
+    def test_completely_different_tables(self):
+        """완전히 다른 테이블"""
+        html1 = "<table><tr><td>A</td></tr></table>"
+        html2 = "<table><tr><td>X</td><td>Y</td></tr><tr><td>Z</td><td>W</td></tr></table>"
+        score = compute_teds(html1, html2)
+        assert 0.0 <= score < 1.0
+
+    def test_one_cell_difference(self):
+        """한 셀 차이"""
+        html1 = "<table><tr><td>A</td><td>B</td></tr></table>"
+        html2 = "<table><tr><td>A</td><td>X</td></tr></table>"
+        score = compute_teds(html1, html2)
+        assert 0.5 < score < 1.0
+
+    def test_empty_vs_nonempty(self):
+        """빈 테이블 vs 비어있지 않은 테이블"""
+        score = compute_teds("", "<table><tr><td>A</td></tr></table>")
+        assert score == 0.0
+
+    def test_both_empty(self):
+        """둘 다 빈 입력"""
+        score = compute_teds("", "")
+        assert score == 1.0
+
+
+class TestCalculateTeds:
+    """마크다운 기반 TEDS 계산 통합 테스트"""
+
+    def test_identical_markdown_tables(self):
+        """동일한 마크다운 테이블"""
+        md = "| A | B |\n|---|---|\n| 1 | 2 |"
+        result = calculate_teds(md, md)
+        assert result["teds"] is not None
+        assert result["teds"] == 1.0
+
+    def test_no_tables_in_reference(self):
+        """참조에 테이블 없음"""
+        result = calculate_teds("| A |\n|---|\n| 1 |", "Just text, no tables")
+        assert result["teds"] is None
+
+    def test_missing_hypothesis_table(self):
+        """예측에 테이블 누락"""
+        ref = "| A | B |\n|---|---|\n| 1 | 2 |"
+        hyp = "No tables here"
+        result = calculate_teds(hyp, ref)
+        assert result["teds"] == 0.0
+        assert result["teds_detail"]["matched_tables"] == 0
+
+    def test_teds_detail_structure(self):
+        """TEDS 상세 결과 구조 확인"""
+        md = "| X | Y |\n|---|---|\n| a | b |"
+        result = calculate_teds(md, md)
+        detail = result["teds_detail"]
+        assert "table_count" in detail
+        assert "matched_tables" in detail
+        assert "per_table_scores" in detail
+        assert detail["table_count"] == 1
+        assert detail["matched_tables"] == 1

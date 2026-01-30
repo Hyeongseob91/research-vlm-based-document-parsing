@@ -33,7 +33,12 @@ from dataclasses import dataclass
 from collections import defaultdict
 from difflib import SequenceMatcher
 
+import json
+from html.parser import HTMLParser
+
 import jiwer
+import mistletoe
+from apted import APTED, Config as AptedConfig
 
 # =============================================================================
 # Import Compatibility Layer
@@ -95,6 +100,9 @@ def detect_file_format(file_path: Path) -> FileFormat:
 def normalize_text(text: str) -> str:
     """텍스트 정규화 - CER/WER 비교를 위한 전처리
 
+    - Pandoc 아티팩트 제거 (div 블록, 참조 속성, 인용, 각주)
+    - 수식 제거 (GT/추출 양쪽 모두 공정 비교)
+    - 이미지 문법 → 캡션만 보존
     - 마크다운 문법 제거
     - 다중 공백/줄바꿈 정규화
     - 앞뒤 공백 제거
@@ -103,6 +111,46 @@ def normalize_text(text: str) -> str:
         return ""
 
     result = text
+
+    # === Pandoc 아티팩트 제거 (마크다운 제거 전에 수행) ===
+
+    # 1. Pandoc div 블록 제거: ::: {.center}, ::: {.wrapfigure}, ::: 단독 라인
+    result = re.sub(r'^:::\s*\{[^}]*\}\s*$', '', result, flags=re.MULTILINE)
+    result = re.sub(r'^:::\s*$', '', result, flags=re.MULTILINE)
+
+    # 2. Pandoc 참조 속성 제거: {#fig:xxx}, {reference-type="ref" ...}
+    result = re.sub(r'\{#[^}]*\}', '', result)
+    result = re.sub(r'\{reference-type="[^"]*"\s+reference="[^"]*"\}', '', result)
+    # [\[tab:config\]]{#tab:config label="tab:config"} 형태
+    result = re.sub(r'\[\\?\[[\w:.-]+\\?\]\]\{[^}]*\}', '', result)
+
+    # 3. 인용 참조 제거: [@hochreiter1997], [@author1; @author2]
+    result = re.sub(r'\[@[^\]]*\]', '', result)
+
+    # 4. 각주 정의 줄 전체 제거: [^1]: Some footnote text...
+    #    (각주 참조 제거보다 먼저 수행해야 [^\w+]: 패턴이 매칭됨)
+    result = re.sub(r'^\[\^\w+\]:.*$', '', result, flags=re.MULTILINE)
+
+    # 4b. 각주 참조 제거: [^4], [^note]
+    result = re.sub(r'\[\^[^\]]+\]', '', result)
+
+    # 5. 이미지 문법 → 캡션만 보존: ![caption](path){#id} → caption
+    result = re.sub(r'!\[([^\]]*)\]\([^)]*\)(?:\{[^}]*\})?', r'\1', result)
+
+    # 6. 수식 제거 (추출 텍스트에도 없으므로 공정한 비교)
+    # $$...$$ 블록 수식
+    result = re.sub(r'\$\$.*?\$\$', '', result, flags=re.DOTALL)
+    # $...$ 인라인 수식
+    result = re.sub(r'\$[^$\n]+\$', '', result)
+
+    # 7. 기타
+    # [Page N] 마커 제거 (PyMuPDF 추출 페이지 구분자)
+    result = re.sub(r'\[Page\s+\d+\]', '', result)
+    # width="\\linewidth" 등 LaTeX 속성
+    result = re.sub(r'width="[^"]*"', '', result)
+    result = re.sub(r'height="[^"]*"', '', result)
+
+    # === 마크다운 문법 제거 ===
 
     # 마크다운 헤더 제거
     result = re.sub(r'^#{1,6}\s+', '', result, flags=re.MULTILINE)
@@ -134,6 +182,25 @@ def normalize_text(text: str) -> str:
     lines = [line for line in lines if line]
 
     return '\n'.join(lines).strip()
+
+
+# =============================================================================
+# Body/References Split (for fair CER evaluation)
+# =============================================================================
+
+def split_body_references(text: str) -> tuple:
+    """텍스트를 본문과 참고문헌으로 분리.
+
+    Returns:
+        (body, references) — references가 없으면 (text, "")
+    """
+    match = re.search(
+        r'^(?:#{0,3}\s*)?(?:References|Bibliography|REFERENCES)\s*$',
+        text, re.MULTILINE
+    )
+    if match:
+        return text[:match.start()].rstrip(), text[match.start():]
+    return text, ""
 
 
 # =============================================================================
@@ -477,6 +544,218 @@ def calculate_structure_f1(hypothesis: str, reference: str, similarity_threshold
 
 
 # =============================================================================
+# TEDS (Tree Edit Distance Similarity) Calculation
+# =============================================================================
+
+def extract_markdown_tables(text: str) -> List[str]:
+    """마크다운 텍스트에서 테이블 블록을 추출
+
+    Args:
+        text: 마크다운 텍스트
+
+    Returns:
+        테이블 블록 문자열 리스트
+    """
+    tables = []
+    current_table_lines = []
+    in_table = False
+
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if re.match(r'^\|.+\|$', stripped):
+            in_table = True
+            current_table_lines.append(stripped)
+        else:
+            if in_table and current_table_lines:
+                tables.append('\n'.join(current_table_lines))
+                current_table_lines = []
+            in_table = False
+
+    if current_table_lines:
+        tables.append('\n'.join(current_table_lines))
+
+    return tables
+
+
+def markdown_table_to_html(md_table: str) -> str:
+    """마크다운 테이블을 HTML <table>로 변환
+
+    Args:
+        md_table: 마크다운 테이블 문자열 (파이프로 구분된 행들)
+
+    Returns:
+        HTML <table> 문자열
+    """
+    html = mistletoe.markdown(md_table)
+    # mistletoe가 <table> 태그를 생성하므로 그대로 반환
+    return html.strip()
+
+
+class _TreeNode:
+    """TEDS 계산을 위한 트리 노드"""
+    def __init__(self, tag: str, text: str = ""):
+        self.tag = tag
+        self.text = text.strip()
+        self.children = []
+
+    def __repr__(self):
+        return f"TreeNode({self.tag}, '{self.text[:20]}')"
+
+
+class _TEDSConfig(AptedConfig):
+    """APTED용 TEDS 커스텀 Config"""
+
+    @staticmethod
+    def rename(node1, node2):
+        """노드 이름 변경 비용 (0이면 동일, 1이면 다름)"""
+        if node1.tag != node2.tag:
+            return 1
+        if node1.tag in ('td', 'th'):
+            # 셀 내용 비교: 다르면 1, 같으면 0
+            if node1.text != node2.text:
+                return 1
+        return 0
+
+    @staticmethod
+    def children(node):
+        """노드의 자식 반환"""
+        return node.children
+
+
+class _HTMLTableTreeBuilder(HTMLParser):
+    """HTML 테이블을 _TreeNode 트리로 변환하는 파서"""
+
+    TABLE_TAGS = {'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td'}
+
+    def __init__(self):
+        super().__init__()
+        self.root = None
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.TABLE_TAGS:
+            node = _TreeNode(tag)
+            if self.stack:
+                self.stack[-1].children.append(node)
+            else:
+                self.root = node
+            self.stack.append(node)
+
+    def handle_endtag(self, tag):
+        if tag in self.TABLE_TAGS and self.stack and self.stack[-1].tag == tag:
+            self.stack.pop()
+
+    def handle_data(self, data):
+        if self.stack and self.stack[-1].tag in ('td', 'th'):
+            self.stack[-1].text += data
+
+
+def html_to_tree(html: str) -> Optional[_TreeNode]:
+    """HTML 테이블 문자열을 _TreeNode 트리로 변환"""
+    builder = _HTMLTableTreeBuilder()
+    builder.feed(html)
+    return builder.root
+
+
+def compute_teds(pred_html: str, gt_html: str) -> float:
+    """두 HTML 테이블 간 TEDS (Tree Edit Distance Similarity) 계산
+
+    Args:
+        pred_html: 예측 HTML 테이블
+        gt_html: Ground Truth HTML 테이블
+
+    Returns:
+        TEDS 점수 (0.0~1.0, 1.0이 완벽 일치)
+    """
+    tree_pred = html_to_tree(pred_html)
+    tree_gt = html_to_tree(gt_html)
+
+    if tree_pred is None and tree_gt is None:
+        return 1.0
+    if tree_pred is None or tree_gt is None:
+        return 0.0
+
+    distance = APTED(tree_pred, tree_gt, _TEDSConfig()).compute_edit_distance()
+
+    # 트리 크기 계산 (노드 수)
+    def count_nodes(node):
+        if node is None:
+            return 0
+        return 1 + sum(count_nodes(c) for c in node.children)
+
+    n_pred = count_nodes(tree_pred)
+    n_gt = count_nodes(tree_gt)
+
+    # TEDS = 1 - (edit_distance / max(|T1|, |T2|))
+    max_nodes = max(n_pred, n_gt)
+    if max_nodes == 0:
+        return 1.0
+
+    teds = 1.0 - distance / max_nodes
+    return max(0.0, teds)
+
+
+def calculate_teds(hypothesis: str, reference: str) -> dict:
+    """마크다운 텍스트에서 테이블을 추출하고 TEDS를 계산
+
+    Args:
+        hypothesis: 파서 출력 (마크다운)
+        reference: Ground Truth (마크다운)
+
+    Returns:
+        {
+            "teds": float or None,
+            "teds_detail": {
+                "table_count": int,
+                "matched_tables": int,
+                "per_table_scores": list[float]
+            }
+        }
+    """
+    ref_tables = extract_markdown_tables(reference)
+    hyp_tables = extract_markdown_tables(hypothesis)
+
+    if not ref_tables:
+        return {
+            "teds": None,
+            "teds_detail": {
+                "table_count": 0,
+                "matched_tables": 0,
+                "per_table_scores": [],
+                "error": "No tables in reference"
+            }
+        }
+
+    # 테이블을 HTML로 변환
+    ref_html_tables = [markdown_table_to_html(t) for t in ref_tables]
+    hyp_html_tables = [markdown_table_to_html(t) for t in hyp_tables]
+
+    per_table_scores = []
+    matched = 0
+
+    # 순서 기반 매칭 (GT 테이블 순서대로)
+    for i, ref_html in enumerate(ref_html_tables):
+        if i < len(hyp_html_tables):
+            score = compute_teds(hyp_html_tables[i], ref_html)
+            per_table_scores.append(round(score, 4))
+            matched += 1
+        else:
+            # 대응하는 예측 테이블 없음
+            per_table_scores.append(0.0)
+
+    avg_teds = sum(per_table_scores) / len(per_table_scores) if per_table_scores else 0.0
+
+    return {
+        "teds": round(avg_teds, 4),
+        "teds_detail": {
+            "table_count": len(ref_tables),
+            "matched_tables": matched,
+            "per_table_scores": per_table_scores
+        }
+    }
+
+
+# =============================================================================
 # Parser Tests
 # =============================================================================
 
@@ -701,20 +980,36 @@ def evaluate_results(results: dict, ground_truth: str, tokenizer=None, tokenizer
         # 정규화 (CER/WER용)
         content_normalized = normalize_text(content)
 
-        # CER, WER 계산 (jiwer)
+        # CER, WER 계산 (jiwer) — Full CER
         cer_result = calculate_cer(content_normalized, gt_normalized)
         wer_result = calculate_wer(content_normalized, gt_normalized, tokenizer)
+
+        # Body CER: 추출에서 References 이후 제외, GT는 전체 (References 없음)
+        hyp_body, _ = split_body_references(content)
+        ref_body, _ = split_body_references(ground_truth)
+        if not ref_body:
+            ref_body = ground_truth
+        hyp_body_normalized = normalize_text(hyp_body)
+        ref_body_normalized = normalize_text(ref_body)
+        body_cer_result = calculate_cer(hyp_body_normalized, ref_body_normalized)
 
         # Structure F1 계산 (원본 마크다운 사용)
         structure_f1_result = calculate_structure_f1(content, ground_truth)
 
+        # TEDS 계산 (테이블 구조 유사도)
+        teds_result = calculate_teds(content, ground_truth)
+
         cer = cer_result["cer"]
+        body_cer = body_cer_result["cer"]
         wer = wer_result["wer"]
         struct_f1 = structure_f1_result.get("structure_f1")
+        teds = teds_result.get("teds")
 
         print(f"{parser_name}:")
-        print(f"   - CER: {cer:.4f} ({cer*100:.2f}%)")
+        print(f"   - CER (Full): {cer:.4f} ({cer*100:.2f}%)")
         print(f"      S:{cer_result.get('substitutions', 0)} D:{cer_result.get('deletions', 0)} I:{cer_result.get('insertions', 0)}")
+        print(f"   - CER (Body): {body_cer:.4f} ({body_cer*100:.2f}%)")
+        print(f"      S:{body_cer_result.get('substitutions', 0)} D:{body_cer_result.get('deletions', 0)} I:{body_cer_result.get('insertions', 0)}")
         print(f"   - WER: {wer:.4f} ({wer*100:.2f}%)")
         print(f"      S:{wer_result.get('substitutions', 0)} D:{wer_result.get('deletions', 0)} I:{wer_result.get('insertions', 0)}")
         print(f"      Tokens: ref={wer_result.get('ref_tokens', 0)} hyp={wer_result.get('hyp_tokens', 0)}")
@@ -728,16 +1023,32 @@ def evaluate_results(results: dict, ground_truth: str, tokenizer=None, tokenizer
         else:
             print(f"   - Structure F1: N/A ({structure_f1_result.get('error', 'unknown error')})")
 
+        # TEDS 출력
+        if teds is not None:
+            teds_detail = teds_result.get("teds_detail", {})
+            print(f"   - TEDS: {teds:.4f} ({teds*100:.2f}%)")
+            print(f"      Tables: {teds_detail.get('matched_tables', 0)}/{teds_detail.get('table_count', 0)} matched")
+            per_scores = teds_detail.get('per_table_scores', [])
+            if per_scores:
+                print(f"      Per-table: {per_scores}")
+        else:
+            teds_detail = teds_result.get("teds_detail", {})
+            print(f"   - TEDS: N/A ({teds_detail.get('error', 'No tables')})")
+
         print(f"   - Latency: {result.get('elapsed_time', 0):.2f}s")
         print()
 
         evaluation[parser_name] = {
             "cer": cer,
             "cer_detail": cer_result,
+            "body_cer": body_cer,
+            "body_cer_detail": body_cer_result,
             "wer": wer,
             "wer_detail": wer_result,
             "structure_f1": struct_f1,
             "structure_f1_detail": structure_f1_result,
+            "teds": teds,
+            "teds_detail": teds_result.get("teds_detail"),
             "latency": result.get("elapsed_time", 0),
             "tokenizer": tokenizer_name
         }
@@ -756,7 +1067,6 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
         tokenizer_name: 토크나이저 이름
         metadata: 테스트 메타데이터
     """
-    import json
     from datetime import datetime
 
     output_path = Path(output_dir)
@@ -822,8 +1132,27 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
         if evaluation and name in evaluation:
             eval_data = evaluation[name]
             eval_json["parsers"][name]["cer"] = eval_data.get("cer")
+            eval_json["parsers"][name]["body_cer"] = eval_data.get("body_cer")
             eval_json["parsers"][name]["wer"] = eval_data.get("wer")
             eval_json["parsers"][name]["structure_f1"] = eval_data.get("structure_f1")
+            eval_json["parsers"][name]["teds"] = eval_data.get("teds")
+            # CER 상세 (S/D/I/hits)
+            if eval_data.get("cer_detail"):
+                cd = eval_data["cer_detail"]
+                eval_json["parsers"][name]["cer_detail"] = {
+                    "substitutions": cd.get("substitutions"),
+                    "deletions": cd.get("deletions"),
+                    "insertions": cd.get("insertions"),
+                    "hits": cd.get("hits"),
+                }
+            if eval_data.get("body_cer_detail"):
+                bcd = eval_data["body_cer_detail"]
+                eval_json["parsers"][name]["body_cer_detail"] = {
+                    "substitutions": bcd.get("substitutions"),
+                    "deletions": bcd.get("deletions"),
+                    "insertions": bcd.get("insertions"),
+                    "hits": bcd.get("hits"),
+                }
             # Structure F1 상세 정보
             if eval_data.get("structure_f1_detail"):
                 sf1_detail = eval_data["structure_f1_detail"]
@@ -836,6 +1165,9 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
                     "hypothesis_elements": sf1_detail.get("hypothesis_elements"),
                     "reference_elements": sf1_detail.get("reference_elements")
                 }
+            # TEDS 상세 정보
+            if eval_data.get("teds_detail"):
+                eval_json["parsers"][name]["teds_detail"] = eval_data["teds_detail"]
 
     meta_path = output_path / "evaluation.json"
     meta_path.write_text(json.dumps(eval_json, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -866,17 +1198,21 @@ def save_results_to_files(results: dict, output_dir: str, pdf_name: str, evaluat
             "",
             "## Evaluation (vs Ground Truth)",
             "",
-            "| Parser | CER | WER | Struct-F1 |",
-            "|--------|-----|-----|-----------|",
+            "| Parser | Body CER | Full CER | WER | Struct-F1 | TEDS |",
+            "|--------|----------|----------|-----|-----------|------|",
         ])
         for name, eval_data in evaluation.items():
             cer = eval_data.get("cer")
+            body_cer = eval_data.get("body_cer")
             wer = eval_data.get("wer")
             struct_f1 = eval_data.get("structure_f1")
+            teds = eval_data.get("teds")
+            body_cer_str = f"{body_cer*100:.2f}%" if body_cer is not None else "N/A"
             cer_str = f"{cer*100:.2f}%" if cer is not None else "N/A"
             wer_str = f"{wer*100:.2f}%" if wer is not None else "N/A"
             struct_f1_str = f"{struct_f1*100:.2f}%" if struct_f1 is not None else "N/A"
-            summary_lines.append(f"| {name} | {cer_str} | {wer_str} | {struct_f1_str} |")
+            teds_str = f"{teds*100:.2f}%" if teds is not None else "N/A"
+            summary_lines.append(f"| {name} | {body_cer_str} | {cer_str} | {wer_str} | {struct_f1_str} | {teds_str} |")
 
     summary_path = output_path / "README.md"
     summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
@@ -901,20 +1237,24 @@ def print_summary(results: dict, evaluation: dict = None):
         print(f"| {name} | {success} | {time_str} | {length} chars |")
 
     if evaluation:
-        print("\n| Parser | CER | WER | Struct-F1 | Latency |")
-        print("|--------|-----|-----|-----------|---------|")
+        print("\n| Parser | Body CER | Full CER | WER | Struct-F1 | TEDS | Latency |")
+        print("|--------|----------|----------|-----|-----------|------|---------|")
 
         for name, eval_result in evaluation.items():
             cer = eval_result.get("cer")
+            body_cer = eval_result.get("body_cer")
             wer = eval_result.get("wer")
             struct_f1 = eval_result.get("structure_f1")
+            teds = eval_result.get("teds")
             latency = eval_result.get("latency", 0)
 
+            body_cer_str = f"{body_cer*100:.2f}%" if body_cer is not None else "N/A"
             cer_str = f"{cer*100:.2f}%" if cer is not None else "N/A"
             wer_str = f"{wer*100:.2f}%" if wer is not None else "N/A"
             struct_f1_str = f"{struct_f1*100:.2f}%" if struct_f1 is not None else "N/A"
+            teds_str = f"{teds*100:.2f}%" if teds is not None else "N/A"
 
-            print(f"| {name} | {cer_str} | {wer_str} | {struct_f1_str} | {latency:.2f}s |")
+            print(f"| {name} | {body_cer_str} | {cer_str} | {wer_str} | {struct_f1_str} | {teds_str} | {latency:.2f}s |")
 
 
 # =============================================================================
@@ -1168,34 +1508,40 @@ def run_all_tests(
     print("전체 테스트 요약")
     print("=" * 60)
 
-    # CER 요약 테이블
-    header_parts = ["Test ID", "Text-Base CER", "Image-Base CER"]
-    if not skip_advanced:
-        header_parts.extend(["Text-Adv CER", "Image-Adv CER"])
-
-    print("\n### CER (Character Error Rate)")
-    print(f"| {' | '.join(header_parts)} |")
-    print(f"|{'-' * 10}|{'-' * 15}|{'-' * 16}|" +
-          (f"{'-' * 14}|{'-' * 15}|" if not skip_advanced else ""))
+    # Body CER 요약 테이블
+    print("\n### Body CER (References 제외)")
+    print(f"| {'Test ID':<20} | {'Text-Base':>10} | {'Img-Base':>10} |" +
+          (f" {'Text-Adv':>10} | {'Img-Adv':>10} |" if not skip_advanced else ""))
+    print(f"|{'-' * 22}|{'-' * 12}|{'-' * 12}|" +
+          (f"{'-' * 12}|{'-' * 12}|" if not skip_advanced else ""))
 
     for test_id, result in all_results.items():
         eval_data = result.get("evaluation", {}) or {}
-
-        text_base_cer = eval_data.get("Text-Baseline", {}).get("cer")
-        image_base_cer = eval_data.get("Image-Baseline", {}).get("cer")
-
-        text_base_str = f"{text_base_cer*100:.1f}%" if text_base_cer is not None else "N/A"
-        image_base_str = f"{image_base_cer*100:.1f}%" if image_base_cer is not None else "N/A"
-
-        row = f"| {test_id:<8} | {text_base_str:<13} | {image_base_str:<14} |"
-
+        vals = []
+        for pname in ["Text-Baseline", "Image-Baseline"] + (["Text-Advanced", "Image-Advanced"] if not skip_advanced else []):
+            v = eval_data.get(pname, {}).get("body_cer")
+            vals.append(f"{v*100:.1f}%" if v is not None else "N/A")
+        row = f"| {test_id:<20} | {vals[0]:>10} | {vals[1]:>10} |"
         if not skip_advanced:
-            text_adv_cer = eval_data.get("Text-Advanced", {}).get("cer")
-            image_adv_cer = eval_data.get("Image-Advanced", {}).get("cer")
-            text_adv_str = f"{text_adv_cer*100:.1f}%" if text_adv_cer is not None else "N/A"
-            image_adv_str = f"{image_adv_cer*100:.1f}%" if image_adv_cer is not None else "N/A"
-            row += f" {text_adv_str:<12} | {image_adv_str:<13} |"
+            row += f" {vals[2]:>10} | {vals[3]:>10} |"
+        print(row)
 
+    # Full CER 요약 테이블
+    print("\n### Full CER (전체)")
+    print(f"| {'Test ID':<20} | {'Text-Base':>10} | {'Img-Base':>10} |" +
+          (f" {'Text-Adv':>10} | {'Img-Adv':>10} |" if not skip_advanced else ""))
+    print(f"|{'-' * 22}|{'-' * 12}|{'-' * 12}|" +
+          (f"{'-' * 12}|{'-' * 12}|" if not skip_advanced else ""))
+
+    for test_id, result in all_results.items():
+        eval_data = result.get("evaluation", {}) or {}
+        vals = []
+        for pname in ["Text-Baseline", "Image-Baseline"] + (["Text-Advanced", "Image-Advanced"] if not skip_advanced else []):
+            v = eval_data.get(pname, {}).get("cer")
+            vals.append(f"{v*100:.1f}%" if v is not None else "N/A")
+        row = f"| {test_id:<20} | {vals[0]:>10} | {vals[1]:>10} |"
+        if not skip_advanced:
+            row += f" {vals[2]:>10} | {vals[3]:>10} |"
         print(row)
 
     # Structure F1 요약 테이블
@@ -1232,6 +1578,100 @@ def run_all_tests(
 
 
 # =============================================================================
+# OmniDocBench Integration
+# =============================================================================
+
+def run_omnidocbench(
+    dataset_path: Path,
+    results_dir: Path = Path("results"),
+    limit: Optional[int] = None,
+    verbose: bool = False,
+):
+    """OmniDocBench 데이터셋 평가 실행
+
+    Args:
+        dataset_path: OmniDocBench JSON 파일 또는 디렉토리 경로
+        results_dir: 결과 저장 디렉토리
+        limit: 최대 페이지 수 제한
+        verbose: 상세 출력
+    """
+    from src.adapters.omnidocbench import load_omnidocbench_dataset
+
+    print("=" * 60)
+    print("OmniDocBench Evaluation")
+    print("=" * 60)
+    print(f"데이터셋: {dataset_path}")
+    if limit:
+        print(f"제한: {limit} 페이지")
+
+    if not dataset_path.exists():
+        print(f"데이터셋을 찾을 수 없습니다: {dataset_path}")
+        sys.exit(1)
+
+    pages = load_omnidocbench_dataset(dataset_path, limit=limit)
+    print(f"로드된 페이지: {len(pages)}")
+
+    if not pages:
+        print("평가할 페이지가 없습니다.")
+        return
+
+    output_dir = results_dir / "omnidocbench"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_teds_scores = []
+    page_results = []
+
+    for i, page in enumerate(pages):
+        page_id = page["page_id"]
+        gt_md = page["gt_markdown"]
+        gt_table_htmls = page["gt_table_htmls"]
+
+        if verbose:
+            print(f"\n[{i+1}/{len(pages)}] Page {page_id}")
+            print(f"  GT 길이: {len(gt_md)} chars, 테이블: {len(gt_table_htmls)}개")
+
+        page_results.append({
+            "page_id": page_id,
+            "gt_length": len(gt_md),
+            "table_count": len(gt_table_htmls),
+            "metadata": page.get("metadata", {}),
+        })
+
+        # 테이블이 있는 페이지만 TEDS 통계에 포함
+        if gt_table_htmls:
+            all_teds_scores.append({
+                "page_id": page_id,
+                "table_count": len(gt_table_htmls),
+            })
+
+    # 요약 출력
+    print(f"\n{'=' * 60}")
+    print("OmniDocBench 데이터셋 요약")
+    print(f"{'=' * 60}")
+    print(f"총 페이지: {len(pages)}")
+    print(f"테이블 포함 페이지: {len(all_teds_scores)}")
+    total_tables = sum(s["table_count"] for s in all_teds_scores)
+    print(f"총 테이블 수: {total_tables}")
+
+    # 결과 JSON 저장
+    summary = {
+        "dataset": str(dataset_path),
+        "total_pages": len(pages),
+        "pages_with_tables": len(all_teds_scores),
+        "total_tables": total_tables,
+        "pages": page_results,
+    }
+
+    summary_path = output_dir / "omnidocbench_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\n요약 저장: {summary_path}")
+
+    print("\nOmniDocBench 데이터셋 로드 완료.")
+    print("파서 실행은 별도 파이프라인에서 수행한 뒤,")
+    print("결과를 기존 evaluate_results()로 평가하세요.")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1258,7 +1698,7 @@ def main():
         """
     )
 
-    # 입력 모드 (--all 또는 --input)
+    # 입력 모드 (--all 또는 --input 또는 --omnidocbench)
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
         "--all", "-a",
@@ -1272,6 +1712,10 @@ def main():
     input_group.add_argument(
         "--pdf", "-p",
         help="테스트할 PDF 파일 경로 (레거시 옵션)"
+    )
+    input_group.add_argument(
+        "--omnidocbench",
+        help="OmniDocBench 데이터셋 경로 (JSON 파일 또는 디렉토리)"
     )
 
     parser.add_argument(
@@ -1315,8 +1759,24 @@ def main():
         default="whitespace",
         help="WER 계산용 토크나이저 (기본: whitespace)"
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="OmniDocBench 서브셋 제한 (페이지 수)"
+    )
 
     args = parser.parse_args()
+
+    # --omnidocbench 모드
+    if args.omnidocbench:
+        run_omnidocbench(
+            dataset_path=Path(args.omnidocbench),
+            results_dir=args.results_dir,
+            limit=args.limit,
+            verbose=args.verbose,
+        )
+        return
 
     # --all 모드: 전체 테스트
     if args.all:
