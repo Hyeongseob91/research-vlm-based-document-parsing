@@ -1,0 +1,25 @@
+# WigtnOCR Default Configuration
+
+vlm:
+  # Override with environment-specific configs (e.g. configs/lab.yaml)
+  qwen3_vl_30b:
+    url: "http://localhost:8000/v1/chat/completions"
+    model: "qwen3-vl-30b-thinking"
+    port: 8000
+  qwen3_vl_8b:
+    url: "http://localhost:8004/v1/chat/completions"
+    model: "qwen3-vl-8b-thinking"
+    port: 8004
+  qwen3_vl_2b:
+    url: "http://localhost:8010/v1/chat/completions"
+    model: "qwen3-vl-2b-instruct"
+    port: 8010
+
+embedding:
+  url: "http://localhost:8001/embeddings"
+  model: "BAAI/bge-m3"
+
+paths:
+  datasets: "datasets"
+  results: "results"
+  checkpoints: "checkpoints"

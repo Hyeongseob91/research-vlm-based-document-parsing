@@ -1,0 +1,26 @@
+# Evaluation Configuration
+
+metrics:
+  cer_threshold: 0.05  # Auto-approve GT below this CER
+  structure_elements: ["headings", "lists", "tables", "code_blocks"]
+
+parsers:
+  - name: "text_baseline"
+    type: "pymupdf"
+    gpu: false
+  - name: "image_baseline"
+    type: "rapidocr"
+    gpu: false
+  - name: "text_advanced"
+    type: "two_stage"
+    stage1: "pymupdf"
+    gpu: true
+  - name: "image_advanced"
+    type: "two_stage"
+    stage1: "rapidocr"
+    gpu: true
+
+chunking:
+  breakpoint_type: "percentile"
+  breakpoint_threshold: 95.0
+  embedding_model: "BAAI/bge-m3"

@@ -1,0 +1,26 @@
+# LoRA Fine-tuning Configuration
+
+model:
+  base: "Qwen/Qwen3-VL-2B-Instruct"
+  output: "checkpoints/wigtnocr-ko-gov-2b"
+
+lora:
+  r: 64
+  alpha: 128
+  target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  dropout: 0.05
+
+training:
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.03
+  num_epochs: 3
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  bf16: true
+  max_seq_length: 4096
+
+data:
+  train_dir: "datasets/documents"
+  replay_ratio: 0.1
+  max_pages_per_doc: null
+  image_dpi: 150
