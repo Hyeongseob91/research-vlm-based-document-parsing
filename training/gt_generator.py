@@ -12,6 +12,7 @@ Supports concurrent batch processing for faster throughput.
 
 import base64
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -21,7 +22,12 @@ from typing import Optional
 import fitz  # PyMuPDF
 import httpx
 
-from training.prompts.templates import PSEUDO_GT_SYSTEM_PROMPT, PSEUDO_GT_USER_PROMPT
+from training.prompts.templates import (
+    PSEUDO_GT_SYSTEM_PROMPT,
+    PSEUDO_GT_USER_PROMPT,
+    PSEUDO_GT_SYSTEM_PROMPT_EN,
+    PSEUDO_GT_USER_PROMPT_EN,
+)
 
 
 @dataclass
@@ -62,14 +68,17 @@ def call_vlm_with_image(
     model: str,
     timeout: float = 180.0,
     max_tokens: int = 8192,
+    lang: str = "ko",
 ) -> str:
     """Send a page image to VLM and get structured markdown back."""
+    system_prompt = PSEUDO_GT_SYSTEM_PROMPT_EN if lang == "en" else PSEUDO_GT_SYSTEM_PROMPT
+    user_prompt = PSEUDO_GT_USER_PROMPT_EN if lang == "en" else PSEUDO_GT_USER_PROMPT
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": PSEUDO_GT_SYSTEM_PROMPT,
+                "content": system_prompt,
             },
             {
                 "role": "user",
@@ -82,14 +91,14 @@ def call_vlm_with_image(
                     },
                     {
                         "type": "text",
-                        "text": PSEUDO_GT_USER_PROMPT,
+                        "text": user_prompt,
                     },
                 ],
             },
         ],
         "max_tokens": max_tokens,
         "temperature": 0.1,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True},
     }
 
     with httpx.Client(timeout=timeout) as client:
@@ -97,23 +106,67 @@ def call_vlm_with_image(
         response.raise_for_status()
         result = response.json()
 
-    raw = result["choices"][0]["message"]["content"]
+    message = result["choices"][0]["message"]
+
+    # 1차: reasoning-parser가 분리한 content 사용 (reasoning 필드가 있으면 분리 성공)
+    if message.get("reasoning_content") is not None:
+        raw = message["content"] or ""
+    else:
+        # 2차: reasoning-parser 미작동 시 raw content에서 후처리로 thinking 제거
+        raw = message["content"] or ""
+
     return _clean_response(raw)
 
 
+# Thinking 오염 패턴: 태그 없이 raw thinking이 출력된 경우 감지
+_THINKING_PATTERNS = re.compile(
+    r"^(Okay,? let'?s|Got it,? let'?s|First,? I need to|Let me (think|check|look|analyze|start))"
+    r"|^Wait,? (the |let me|I need)"
+    r"|^(But how|But the |However,? the |Perhaps the )"
+    r"|^(Now,? (let'?s|I need|let me))"
+    r"|^Looking at the (image|table|document)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _clean_response(raw: str) -> str:
-    """Remove thinking tags and code fences from VLM response."""
+    """Remove thinking tags, raw thinking text, and code fences from VLM response.
+
+    Handles three cases:
+    1. Proper <think>...</think> tags → split on </think>, take content after
+    2. Only </think> closing tag (template places <think> in prompt) → split on </think>
+    3. No tags but raw thinking text → detect patterns and warn
+    """
     content = raw
+
+    # Case 1 & 2: </think> 태그가 있으면 그 이후만 사용
     if "</think>" in content:
         content = content.split("</think>", 1)[1]
+
+    # <think> 열림 태그가 남아있으면 제거
+    content = re.sub(r"<think>.*?(?:</think>|$)", "", content, flags=re.DOTALL)
+
     content = content.strip()
+
+    # Code fence 제거
     if content.startswith("```markdown"):
         content = content[len("```markdown"):]
     if content.startswith("```"):
         content = content[3:]
     if content.endswith("```"):
         content = content[:-3]
-    return content.strip()
+
+    content = content.strip()
+
+    # Case 3: 태그 없이 thinking이 본문에 섞인 경우 경고 로깅
+    if content and _THINKING_PATTERNS.search(content[:500]):
+        # thinking으로 시작하지만 실제 markdown 내용이 뒤에 있을 수 있음
+        # 첫 markdown heading(#)이나 table(|)이 나오는 지점부터 사용
+        md_match = re.search(r"^(#{1,6}\s|\|)", content, re.MULTILINE)
+        if md_match and md_match.start() > 50:
+            content = content[md_match.start():]
+
+    return content
 
 
 def _process_single_page(
@@ -125,6 +178,7 @@ def _process_single_page(
     dpi: int,
     max_tokens: int,
     timeout: float,
+    lang: str = "ko",
 ) -> PageResult:
     """Process a single page: render → VLM → save. Used by thread pool."""
     start = time.time()
@@ -136,6 +190,7 @@ def _process_single_page(
             model=model,
             timeout=timeout,
             max_tokens=max_tokens,
+            lang=lang,
         )
         page_file.write_text(markdown, encoding="utf-8")
         elapsed = time.time() - start
@@ -167,6 +222,7 @@ def generate_pseudo_gt(
     max_pages: Optional[int] = None,
     skip_existing: bool = True,
     batch_size: int = 4,
+    lang: str = "ko",
 ) -> GTGenerationResult:
     """Generate pseudo GT for a PDF document.
 
@@ -242,6 +298,7 @@ def generate_pseudo_gt(
                     dpi=dpi,
                     max_tokens=max_tokens,
                     timeout=timeout,
+                    lang=lang,
                 )
                 futures[future] = page_num
 

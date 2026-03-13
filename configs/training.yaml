@@ -1,26 +1,32 @@
-# LoRA Fine-tuning Configuration
+# WigtnOCR LoRA Fine-tuning Configuration (ms-swift)
+# Usage: python -m training.lora_trainer --config configs/training.yaml
 
 model:
   base: "Qwen/Qwen3-VL-2B-Instruct"
-  output: "checkpoints/wigtnocr-ko-gov-2b"
+  output: "output/wigtnocr-2b-lora"
 
 lora:
-  r: 64
-  alpha: 128
-  target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
-  dropout: 0.05
+  r: 8
+  alpha: 32
+  target_modules: "all-linear"
+  # freeze_vit + freeze_aligner: only train LLM layers with LoRA
 
 training:
-  learning_rate: 2.0e-5
-  warmup_ratio: 0.03
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05
   num_epochs: 3
-  batch_size: 4
-  gradient_accumulation_steps: 8
-  bf16: true
+  batch_size: 1
+  gradient_accumulation_steps: 4
   max_seq_length: 4096
 
 data:
-  train_dir: "datasets/documents"
-  replay_ratio: 0.1
-  max_pages_per_doc: null
-  image_dpi: 150
+  train_dir: "datasets"
+  min_score: 3          # Minimum validation score to include
+  max_doc_ratio: 0.25   # Max ratio per document (kogov_008 bias correction)
+  val_ratio: 0.1        # Validation split ratio
+  image_dpi: 200
+
+hardware:
+  nproc_per_node: 2     # Number of GPUs
+  deepspeed: "zero2"
+  bf16: true

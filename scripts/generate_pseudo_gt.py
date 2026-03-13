@@ -44,7 +44,13 @@ def main():
     parser.add_argument("--timeout", type=float, default=180.0, help="API timeout (seconds)")
     parser.add_argument("--batch-size", type=int, default=4, help="Concurrent VLM requests")
     parser.add_argument("--force", action="store_true", help="Regenerate even if gt.md exists")
+    parser.add_argument("--lang", choices=["ko", "en"], default=None,
+                        help="Language (default: auto-detect from dataset)")
     args = parser.parse_args()
+
+    # Auto-detect language from dataset
+    if args.lang is None:
+        args.lang = "en" if args.dataset == "papers" else "ko"
 
     dataset_dir = Path("datasets") / args.dataset
 
@@ -61,14 +67,16 @@ def main():
     else:
         doc_dirs = sorted(d for d in dataset_dir.iterdir() if d.is_dir())
 
-    # Filter to those with doc.pdf
+    # Filter to those with PDF (doc.pdf or paper.pdf)
     targets = []
     for d in doc_dirs:
         pdf = d / "doc.pdf"
+        if not pdf.exists():
+            pdf = d / "paper.pdf"
         if pdf.exists():
             targets.append((d, pdf))
         else:
-            print(f"  [WARN] {d.name}: no doc.pdf found, skipping")
+            print(f"  [WARN] {d.name}: no PDF found, skipping")
 
     if not targets:
         print("No documents to process.")
@@ -82,6 +90,7 @@ def main():
     print(f"  API: {args.api_url}")
     print(f"  DPI: {args.dpi}")
     print(f"  Batch size: {args.batch_size}")
+    print(f"  Language: {args.lang}")
     if args.max_pages:
         print(f"  Max pages: {args.max_pages}")
     print(f"{'=' * 60}\n")
@@ -102,6 +111,7 @@ def main():
             max_pages=args.max_pages,
             skip_existing=not args.force,
             batch_size=args.batch_size,
+            lang=args.lang,
         )
         results.append(result)
         print(f"  -> {result.processed_pages}/{result.total_pages} pages, "
