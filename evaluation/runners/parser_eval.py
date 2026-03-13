@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from evaluation.metrics.cer import calculate_cer, calculate_wer
-from evaluation.metrics.structure import calculate_structure_f1
+from evaluation.metrics.structure import calculate_structure_eval
 
 
 def evaluate_single_document(
@@ -47,11 +47,14 @@ def evaluate_single_document(
 
     cer = calculate_cer(ocr_result.content, gt_text)
     wer = calculate_wer(ocr_result.content, gt_text)
-    sf1 = calculate_structure_f1(ocr_result.content, gt_text)
+    struct = calculate_structure_eval(ocr_result.content, gt_text)
 
     results["text_baseline"] = {
         "cer": cer, "wer": wer,
-        "structure_f1": sf1.f1,
+        "element_ned": struct.element_ned,
+        "reading_order_ned": struct.reading_order_ned,
+        "detection_f1": struct.detection_f1,
+        "per_type_ned": struct.per_type_ned,
         "elapsed_time": elapsed,
     }
 
@@ -65,11 +68,14 @@ def evaluate_single_document(
 
         cer = calculate_cer(ts_result.content, gt_text)
         wer = calculate_wer(ts_result.content, gt_text)
-        sf1 = calculate_structure_f1(ts_result.content, gt_text)
+        struct = calculate_structure_eval(ts_result.content, gt_text)
 
         results["text_advanced"] = {
             "cer": cer, "wer": wer,
-            "structure_f1": sf1.f1,
+            "element_ned": struct.element_ned,
+            "reading_order_ned": struct.reading_order_ned,
+            "detection_f1": struct.detection_f1,
+            "per_type_ned": struct.per_type_ned,
             "elapsed_time": ts_result.elapsed_time,
             "stage1_time": ts_result.stage1_time,
             "stage2_time": ts_result.stage2_time,
