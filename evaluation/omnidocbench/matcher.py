@@ -11,7 +11,7 @@ import Levenshtein
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from evaluation.omnidocbench.normalizer import clean_string, normalize_formula
+from evaluation.omnidocbench.normalizer import clean_string, normalize_formula, textblock2unicode
 
 
 def match_text_elements(
@@ -46,8 +46,8 @@ def match_text_elements(
         pred_texts.append(text)
 
     if normalize:
-        gt_norm = [clean_string(t) for t in gt_texts]
-        pred_norm = [clean_string(t) for t in pred_texts]
+        gt_norm = [clean_string(textblock2unicode(t)) for t in gt_texts]
+        pred_norm = [clean_string(textblock2unicode(t)) for t in pred_texts]
     else:
         gt_norm = gt_texts
         pred_norm = pred_texts

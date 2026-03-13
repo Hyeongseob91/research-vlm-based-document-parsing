@@ -222,7 +222,7 @@ def extract_gt_elements(page_data: dict) -> dict[str, list[GTElement]]:
     }
     formula_categories = {"equation_isolated"}
 
-    for item in sorted(all_items, key=lambda x: x.get("order", 0)):
+    for item in sorted(all_items, key=lambda x: x.get("order") or 0):
         cat = item.get("category_type", "")
         gt_el = GTElement(
             category=cat,
