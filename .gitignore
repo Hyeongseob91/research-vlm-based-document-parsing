@@ -67,3 +67,5 @@ checkpoints/
 # Reference materials (local only)
 docs/reference/
 datasets
+output/
+
