@@ -7,7 +7,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](#)
-[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-WigtnOCR--2B-yellow)](https://huggingface.co/wigtn/WigtnOCR-2B)
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-WigtnOCR--2B-yellow)](https://huggingface.co/Wigtn/Qwen3-VL-2B-WigtnOCR)
 
 <a href="README.md"><img src="https://img.shields.io/badge/English-gray?style=for-the-badge" alt="English"></a>
 <a href="README.ko.md"><img src="https://img.shields.io/badge/한국어-blue?style=for-the-badge" alt="Korean"></a>
@@ -128,7 +128,7 @@ GT는 Qwen3-VL-30B로 생성, Qwen3.5-122B로 검증 (텍스트 전용 judge, 5�
 
 모델 가중치는 HuggingFace에서 제공됩니다:
 
-- **[WigtnOCR-2B](https://huggingface.co/wigtn/WigtnOCR-2B)** — 배포 모델 (Qwen3-VL-2B + LoRA 파인튜닝)
+- **[WigtnOCR-2B](https://huggingface.co/Wigtn/Qwen3-VL-2B-WigtnOCR)** — 배포 모델 (Qwen3-VL-2B + LoRA 파인튜닝)
 
 ---
 
@@ -157,6 +157,6 @@ Apache License 2.0
   title   = {WigtnOCR: Pseudo-Label Distillation for Structure-Preserving Document Parsing},
   author  = {Kim, Hyeongseob},
   year    = {2026},
-  url     = {https://github.com/Hyeongseob91/research-vlm-based-document-parsing}
+  url     = {https://github.com/WIGTN/wigtnOCR-v1}
 }
 ```
