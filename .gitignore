@@ -55,23 +55,24 @@ Thumbs.db
 *.temp
 .tmp/
 
-# Datasets (large binary files)
-datasets/papers/*/doc.pdf
-datasets/papers/*/gt.md
-datasets/documents/*/doc.pdf
-datasets/omnidocbench/images/
-
 # Model Checkpoints
 checkpoints/
-
-# Reference materials (local only)
-docs/reference/
-datasets
 output/
 
-# Training code (private — not included in OSS release)
-training/
-scripts/training/
-configs/training.yaml
-docs/e2e_post_training_guide.md
+# Datasets
+datasets/
 
+# Source code (private — not included in public release)
+wigtnocr/
+evaluation/
+training/
+scripts/
+configs/
+pyproject.toml
+
+# Docs (private — only figures are public)
+docs/paper/
+docs/references/
+docs/e2e_post_training_guide.md
+docs/GIT_HISTORY_ARCHIVE.md
+docs/GIT_HISTORY_DETAILED.md
